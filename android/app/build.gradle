@@ -91,7 +91,7 @@ dependencies {
     // JVM unit tests (src/test): run on every debug build, no emulator needed.
     testImplementation 'junit:junit:4.13.2'
     // Real org.json for unit tests (android.jar only ships throwing stubs).
-    testImplementation 'org.json:json:20230618'
+    testImplementation 'org.json:json:20260814'
 }
 
 configurations.configureEach {
