@@ -314,6 +314,48 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - bearerAuth: []
+  /v1/listings/mine:
+    get:
+      tags:
+      - listings
+      summary: List My Listings
+      description: Listings owned by the current user, any status, newest first.
+      operationId: list_my_listings_v1_listings_mine_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response List My Listings V1 Listings Mine Get
+      security:
+      - bearerAuth: []
+  /v1/want-list/matches:
+    get:
+      tags:
+      - listings
+      - want-list
+      summary: Get Want Matches
+      description: 'Live listings matching the current user''s want-list entries.
+
+
+        Defined here (not in wantlist.py) to avoid a listings<->wantlist
+
+        circular import; the route path is unchanged.'
+      operationId: get_want_matches_v1_want_list_matches_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Get Want Matches V1 Want List Matches Get
+      security:
+      - bearerAuth: []
   /v1/listings/{listing_id}:
     get:
       tags:
@@ -1280,6 +1322,33 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - bearerAuth: []
+  /v1/me/swaps:
+    get:
+      tags:
+      - claims
+      - claims
+      summary: My Swaps
+      description: 'List the caller''s swap history (claims where they are claimer
+        or giver).
+
+
+        Returns both sides: claims the user made on others'' listings (counterparty
+
+        = listing owner) and claims others made on the user''s listings (counterparty
+
+        = claimer). Status maps claim lifecycle to the app''s BookingStatus.'
+      operationId: my_swaps_v1_me_swaps_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response My Swaps V1 Me Swaps Get
+      security:
+      - bearerAuth: []
   /v1/sitters/me:
     put:
       tags:
@@ -1348,6 +1417,85 @@ paths:
                 type: object
                 additionalProperties: true
                 title: Response List Sitters V1 Sitters Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - bearerAuth: []
+  /v1/sitters/{sitter_uid}:
+    get:
+      tags:
+      - sitting
+      - sitting
+      summary: Get Sitter
+      description: Single sitter profile by UID. Same shape as one item of GET /v1/sitters.
+      operationId: get_sitter_v1_sitters__sitter_uid__get
+      parameters:
+      - name: sitter_uid
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Sitter Uid
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Get Sitter V1 Sitters  Sitter Uid  Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - bearerAuth: []
+  /v1/bookings:
+    get:
+      tags:
+      - sitting
+      - sitting
+      summary: List Bookings
+      description: 'Sitting requests involving the current user ("bookings").
+
+
+        role=giver → user is the sitter; role=seeker → user is the plant owner;
+
+        anything else returns both sides. completed=true filters to completed
+
+        requests only.'
+      operationId: list_bookings_v1_bookings_get
+      parameters:
+      - name: role
+        in: query
+        required: false
+        schema:
+          type: string
+          default: ''
+          title: Role
+      - name: completed
+        in: query
+        required: false
+        schema:
+          type: boolean
+          default: false
+          title: Completed
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response List Bookings V1 Bookings Get
         '422':
           description: Validation Error
           content:
@@ -2229,12 +2377,16 @@ components:
           exclusiveMinimum: 0.0
           title: Quantity
         pickupStartMs:
-          type: integer
-          minimum: 1.0
+          anyOf:
+          - type: integer
+            minimum: 1.0
+          - type: 'null'
           title: Pickupstartms
         pickupEndMs:
-          type: integer
-          minimum: 1.0
+          anyOf:
+          - type: integer
+            minimum: 1.0
+          - type: 'null'
           title: Pickupendms
         notes:
           anyOf:
@@ -2245,8 +2397,6 @@ components:
       type: object
       required:
       - quantity
-      - pickupStartMs
-      - pickupEndMs
       title: ClaimIn
     ConfirmIn:
       properties:
@@ -2708,16 +2858,16 @@ components:
         category:
           $ref: '#/components/schemas/ReportCategory'
         details:
-          type: string
-          maxLength: 2000
-          minLength: 1
+          anyOf:
+          - type: string
+            maxLength: 2000
+          - type: 'null'
           title: Details
       type: object
       required:
       - targetType
       - targetId
       - category
-      - details
       title: ReportIn
     ResolveIn:
       properties:

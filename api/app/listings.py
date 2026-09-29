@@ -879,6 +879,35 @@ def create_listing(
     return public_listing(row, viewer_uid=uid)
 
 
+@router.get("/listings/mine")
+def list_my_listings(
+    uid: str = Depends(get_current_uid),
+    repo: ListingRepo = Depends(get_listing_repo),
+) -> dict[str, Any]:
+    """Listings owned by the current user, any status, newest first."""
+    return {"listings": [public_listing(r, viewer_uid=uid)
+                        for r in repo.list_by_owner(uid)]}
+
+
+@router.get("/want-list/matches", tags=["want-list"])
+def get_want_matches(
+    uid: str = Depends(get_current_uid),
+    want_repo: WantRepo = Depends(get_want_repo),
+    listing_repo: ListingRepo = Depends(get_listing_repo),
+) -> dict[str, Any]:
+    """Live listings matching the current user's want-list entries.
+
+    Defined here (not in wantlist.py) to avoid a listings<->wantlist
+    circular import; the route path is unchanged.
+    """
+    entries = want_repo.list_for_user(uid)
+    if not entries:
+        return {"items": []}
+    matched = [row for row in listing_repo.list_live(limit=200)
+               if find_matches(row, entries)]
+    return {"items": [public_listing(row, viewer_uid=uid) for row in matched]}
+
+
 @router.get("/listings/{listing_id}")
 def get_listing(
     listing_id: str,

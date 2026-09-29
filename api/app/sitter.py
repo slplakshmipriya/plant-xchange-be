@@ -354,6 +354,61 @@ def list_sitters(
                         for r in repo.list_active(limit=limit, offset=offset)]}
 
 
+@router.get("/sitters/{sitter_uid}", tags=["sitting"])
+def get_sitter(
+    sitter_uid: str,
+    repo: SitterRepo = Depends(get_sitter_repo),
+    user_repo: UserRepo = Depends(get_user_repo),
+) -> dict[str, Any]:
+    """Single sitter profile by UID. Same shape as one item of GET /v1/sitters."""
+    row = repo.get_profile(sitter_uid)
+    if row is None:
+        raise HTTPException(404, {"code": "sitter_not_found",
+                                  "message": "No such sitter"})
+    return _serialize_profile(row, _display_name(user_repo, sitter_uid))
+
+
+@router.get("/bookings", tags=["sitting"])
+def list_bookings(
+    role: str = Query(default=""),
+    completed: bool = Query(default=False),
+    uid: str = Depends(get_current_uid),
+    conn=Depends(get_db_conn),
+) -> dict[str, Any]:
+    """Sitting requests involving the current user ("bookings").
+
+    role=giver → user is the sitter; role=seeker → user is the plant owner;
+    anything else returns both sides. completed=true filters to completed
+    requests only.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if role == "giver":
+        clauses.append("sitter_uid = %s")
+        params.append(uid)
+    elif role == "seeker":
+        clauses.append("owner_uid = %s")
+        params.append(uid)
+    else:
+        clauses.append("(sitter_uid = %s OR owner_uid = %s)")
+        params.extend([uid, uid])
+    if completed:
+        clauses.append("status = 'completed'")
+    rows = conn.execute(
+        "SELECT * FROM sitting_requests WHERE " + " AND ".join(clauses)
+        + " ORDER BY created_at DESC LIMIT 100",
+        tuple(params),
+    ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k in ("start_date", "end_date", "created_at"):
+            v = d.get(k)
+            d[k] = v.isoformat() if hasattr(v, "isoformat") else v
+        out.append(_serialize_request(d))
+    return {"bookings": out}
+
+
 @router.post("/sitting-requests", status_code=201, tags=["sitting"])
 def create_sitting_request(
     data: SittingRequestIn,

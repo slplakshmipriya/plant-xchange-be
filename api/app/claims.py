@@ -412,8 +412,8 @@ class ClaimIn(BaseModel):
     # gt=0 (not ge=1): harvest listings can be fractional (e.g. 0.5 kg),
     # and such a listing could never be claimed with a minimum of 1 (L3).
     quantity: float = Field(gt=0)
-    pickupStartMs: int = Field(ge=1)
-    pickupEndMs: int = Field(ge=1)
+    pickupStartMs: int | None = Field(default=None, ge=1)
+    pickupEndMs: int | None = Field(default=None, ge=1)
     notes: str | None = Field(default=None, max_length=1000)
 
 
@@ -463,7 +463,8 @@ def create_claim(
     available quantity drops atomically; the listing stays live until the
     quantity hits 0 (then it closes) or the listing expires."""
     row = _get_live_listing(listing_id, uid, listing_repo)
-    if data.pickupEndMs <= data.pickupStartMs:
+    if (data.pickupStartMs is not None and data.pickupEndMs is not None
+            and data.pickupEndMs <= data.pickupStartMs):
         raise HTTPException(422, {"code": "invalid_window",
                                   "message": "pickupEndMs must be after pickupStartMs"})
     if user_repo.get(uid) is None:

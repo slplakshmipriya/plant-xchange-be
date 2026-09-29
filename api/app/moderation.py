@@ -124,7 +124,7 @@ class ReportIn(BaseModel):
     targetType: TargetType
     targetId: str = Field(min_length=1, max_length=256)
     category: ReportCategory
-    details: str = Field(min_length=1, max_length=2000)
+    details: str | None = Field(default=None, max_length=2000)
 
 
 class DisputeIn(BaseModel):
@@ -607,9 +607,10 @@ def create_report(
     repo: ModerationRepo = Depends(get_moderation_repo),
 ) -> dict[str, Any]:
     """File a report against a listing, user, or booking. Returns the id."""
+    details = (data.details or "").strip() or None
     report = repo.add_report(reporter_uid=uid, target_type=data.targetType.value,
                              target_id=data.targetId, category=data.category.value,
-                             details=data.details)
+                             details=details)
     return {"id": str(report["id"])}
 
 
