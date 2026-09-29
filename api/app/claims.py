@@ -733,3 +733,57 @@ def record_no_show(
         "no_shows": strike["no_shows"],
         "suspended_until": strike.get("suspended_until"),
     }
+
+
+@router.get("/me/swaps", tags=["claims"])
+def my_swaps(
+    uid: str = Depends(get_current_uid),
+    conn=Depends(get_db_conn),
+) -> dict[str, Any]:
+    """List the caller's swap history (claims where they are claimer or giver).
+
+    Returns both sides: claims the user made on others' listings (counterparty
+    = listing owner) and claims others made on the user's listings (counterparty
+    = claimer). Status maps claim lifecycle to the app's BookingStatus.
+    """
+    status_map = {
+        "pending": "REQUESTED",
+        "accepted": "CONFIRMED",
+        "declined": "CANCELLED",
+        "cancelled": "CANCELLED",
+    }
+    rows = conn.execute(
+        """
+        SELECT c.id AS swap_id,
+               c.status AS claim_status,
+               c.created_at,
+               l.title AS listing_title,
+               CASE
+                 WHEN c.claimer_uid = %(uid)s THEN owner.display_name
+                 ELSE claimer.display_name
+               END AS counterparty,
+               CASE
+                 WHEN c.claimer_uid = %(uid)s THEN 'claimer'
+                 ELSE 'giver'
+               END AS role
+        FROM claims c
+        JOIN listings l ON l.id = c.listing_id
+        LEFT JOIN users owner ON owner.uid = l.owner_uid
+        LEFT JOIN users claimer ON claimer.uid = c.claimer_uid
+        WHERE c.claimer_uid = %(uid)s OR l.owner_uid = %(uid)s
+        ORDER BY c.created_at DESC
+        LIMIT 100
+        """,
+        {"uid": uid},
+    ).fetchall()
+    swaps = [
+        {
+            "swap_id": str(r["swap_id"]),
+            "counterparty": r["counterparty"] or "A gardener",
+            "listing_title": r["listing_title"] or "A listing",
+            "status": status_map.get(r["claim_status"], "REQUESTED"),
+            "role": r["role"],
+        }
+        for r in rows
+    ]
+    return {"swaps": swaps}
