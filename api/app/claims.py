@@ -757,7 +757,7 @@ def my_swaps(
         SELECT c.id AS swap_id,
                c.status AS claim_status,
                c.created_at,
-               l.title AS listing_title,
+               l.variety AS listing_title,
                CASE
                  WHEN c.claimer_uid = %s THEN owner.display_name
                  ELSE claimer.display_name
