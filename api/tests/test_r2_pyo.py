@@ -8,7 +8,7 @@ import pytest
 from app import slots as slots_mod
 from conftest import wire_credit_repo
 
-SLOT_KEYS = {"id", "dayMs", "startMs", "endMs", "maxPickers",
+SLOT_KEYS = {"id", "treeId", "dayMs", "startMs", "endMs", "maxPickers",
              "claimedCount", "creditCost", "cashCents"}
 
 

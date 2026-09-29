@@ -52,10 +52,12 @@ class AlreadyClaimed(Exception):
 
 def public_slot(row: dict[str, Any]) -> dict[str, Any]:
     """Wire shape: exactly
-    {id, dayMs, startMs, endMs, maxPickers, claimedCount, creditCost, cashCents}.
+    {id, treeId, dayMs, startMs, endMs, maxPickers, claimedCount, creditCost,
+    cashCents}.
     """
     return {
         "id": str(row["id"]),
+        "treeId": str(row["tree_id"]),
         "dayMs": row["day_ms"],
         "startMs": row["start_ms"],
         "endMs": row["end_ms"],

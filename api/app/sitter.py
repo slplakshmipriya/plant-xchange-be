@@ -401,11 +401,7 @@ def list_bookings(
     ).fetchall()
     out = []
     for r in rows:
-        d = dict(r)
-        for k in ("start_date", "end_date", "created_at"):
-            v = d.get(k)
-            d[k] = v.isoformat() if hasattr(v, "isoformat") else v
-        out.append(_serialize_request(d))
+        out.append(_serialize_request(dict(r)))
     return {"bookings": out}
 
 
