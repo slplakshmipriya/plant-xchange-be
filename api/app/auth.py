@@ -95,7 +95,11 @@ class FirebaseAuthMiddleware(BaseHTTPMiddleware):
             decoded = verify_id_token(token.strip())
         except Exception as exc:  # noqa: BLE001 — any verification failure is a 401
             logger.info("token verification failed: %s", type(exc).__name__)
-            return error_response(request, 401, "unauthorized", "Invalid or expired ID token")
+            # DEBUG ONLY - revert before production
+            return error_response(
+                request, 401, "unauthorized",
+                f"Invalid or expired ID token [debug: {type(exc).__name__}: {exc}]",
+            )
 
         uid = decoded.get("uid") if isinstance(decoded, dict) else None
         if not uid:
