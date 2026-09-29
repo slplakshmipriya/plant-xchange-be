@@ -759,22 +759,22 @@ def my_swaps(
                c.created_at,
                l.title AS listing_title,
                CASE
-                 WHEN c.claimer_uid = %(uid)s THEN owner.display_name
+                 WHEN c.claimer_uid = %s THEN owner.display_name
                  ELSE claimer.display_name
                END AS counterparty,
                CASE
-                 WHEN c.claimer_uid = %(uid)s THEN 'claimer'
+                 WHEN c.claimer_uid = %s THEN 'claimer'
                  ELSE 'giver'
                END AS role
         FROM claims c
         JOIN listings l ON l.id = c.listing_id
         LEFT JOIN users owner ON owner.uid = l.owner_uid
         LEFT JOIN users claimer ON claimer.uid = c.claimer_uid
-        WHERE c.claimer_uid = %(uid)s OR l.owner_uid = %(uid)s
+        WHERE c.claimer_uid = %s OR l.owner_uid = %s
         ORDER BY c.created_at DESC
         LIMIT 100
         """,
-        {"uid": uid},
+        (uid, uid, uid, uid),
     ).fetchall()
     swaps = [
         {
