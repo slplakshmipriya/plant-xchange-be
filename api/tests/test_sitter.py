@@ -256,3 +256,57 @@ def test_sitter_directory_pagination_bound(mem_sitting):
 
     r = client.get("/v1/sitters?limit=1000", headers=ALICE)
     assert r.status_code == 422  # over the 500 cap
+
+
+def test_sitter_rate_credits_round_trip(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, BOB, "Bob")
+    body = _sitter(client, BOB, rate_amount=5, rate_unit="credits")
+    assert body["rate_amount"] == 5
+    assert body["rate_unit"] == "credits"
+
+    listed = client.get("/v1/sitters", headers=ALICE).json()["sitters"]
+    assert listed[0]["rate_amount"] == 5
+    assert listed[0]["rate_unit"] == "credits"
+
+    single = client.get("/v1/sitters/bob", headers=ALICE).json()
+    assert single["rate_amount"] == 5
+    assert single["rate_unit"] == "credits"
+
+
+def test_sitter_rate_usd_round_trip(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, BOB, "Bob")
+    body = _sitter(client, BOB, rate_amount=12.5, rate_unit="usd")
+    assert body["rate_amount"] == 12.5
+    assert body["rate_unit"] == "usd"
+
+
+def test_sitter_rate_absent_by_default(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, BOB, "Bob")
+    body = _sitter(client, BOB)
+    assert body["rate_amount"] is None
+    assert body["rate_unit"] is None
+
+
+def test_sitter_rate_validation(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, BOB, "Bob")
+    # amount without unit, unit without amount, bad unit
+    for bad in ({"rate_amount": 5}, {"rate_unit": "credits"},
+                {"rate_amount": 5, "rate_unit": "eur"}):
+        r = client.put("/v1/sitters/me", json=bad, headers=BOB)
+        assert r.status_code == 422, (bad, r.text)
+    # fractional credits rejected (ledger is integer)
+    r = client.put("/v1/sitters/me",
+                   json={"rate_amount": 2.5, "rate_unit": "credits"}, headers=BOB)
+    assert r.status_code == 422, r.text
+    # sub-cent usd rejected (NUMERIC(10,2))
+    r = client.put("/v1/sitters/me",
+                   json={"rate_amount": 10.999, "rate_unit": "usd"}, headers=BOB)
+    assert r.status_code == 422, r.text
+    # negative rejected
+    r = client.put("/v1/sitters/me",
+                   json={"rate_amount": -1, "rate_unit": "usd"}, headers=BOB)
+    assert r.status_code == 422, r.text

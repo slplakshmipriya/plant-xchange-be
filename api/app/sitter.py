@@ -19,7 +19,7 @@ from typing import Any, Protocol
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from psycopg import errors as pg_errors
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .auth import get_current_uid
 from .db import get_db_conn
@@ -54,6 +54,9 @@ class SitterRepo(Protocol):
 
 
 def _serialize_profile(row: dict[str, Any], display_name: str | None) -> dict[str, Any]:
+    # rate_amount comes back from Postgres NUMERIC as Decimal — coerce to
+    # float so the JSON response carries a plain number.
+    amount = row.get("rate_amount")
     return {
         "uid": row["uid"],
         "display_name": display_name,
@@ -61,6 +64,8 @@ def _serialize_profile(row: dict[str, Any], display_name: str | None) -> dict[st
         "experience_years": row.get("experience_years", 0),
         "service_radius_miles": row.get("service_radius_miles", 5),
         "active": row.get("active", True),
+        "rate_amount": float(amount) if amount is not None else None,
+        "rate_unit": row.get("rate_unit"),
     }
 
 
@@ -95,15 +100,19 @@ class PostgresSitterRepo:
 
     def upsert_profile(self, uid, fields):
         row = self._conn.execute(
-            """INSERT INTO sitter_profiles (uid, bio, experience_years, service_radius_miles, active)
-               VALUES (%s,%s,%s,%s,%s)
+            """INSERT INTO sitter_profiles (uid, bio, experience_years, service_radius_miles, active,
+                                            rate_amount, rate_unit)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (uid) DO UPDATE SET
                  bio = EXCLUDED.bio, experience_years = EXCLUDED.experience_years,
                  service_radius_miles = EXCLUDED.service_radius_miles,
-                 active = EXCLUDED.active, updated_at = now()
+                 active = EXCLUDED.active,
+                 rate_amount = EXCLUDED.rate_amount, rate_unit = EXCLUDED.rate_unit,
+                 updated_at = now()
                RETURNING *""",
             (uid, fields.get("bio", ""), fields.get("experience_years", 0),
-             fields.get("service_radius_miles", 5), fields.get("active", True)),
+             fields.get("service_radius_miles", 5), fields.get("active", True),
+             fields.get("rate_amount"), fields.get("rate_unit")),
         ).fetchone()
         self._conn.commit()
         return dict(row)
@@ -224,6 +233,8 @@ class MemorySitterRepo:
             "service_radius_miles": fields.get("service_radius_miles",
                                                row.get("service_radius_miles", 5)),
             "active": fields.get("active", row.get("active", True)),
+            "rate_amount": fields.get("rate_amount", row.get("rate_amount")),
+            "rate_unit": fields.get("rate_unit", row.get("rate_unit")),
             "created_at": row.get("created_at", utcnow().isoformat()),
             "updated_at": utcnow().isoformat(),
         })
@@ -296,6 +307,10 @@ class SitterProfileIn(BaseModel):
     experience_years: int = Field(default=0, ge=0, le=60)
     service_radius_miles: float = Field(default=5, gt=0, le=100)
     active: bool = True
+    # Optional daily rate. unit 'credits' = whole credits/day (the credit
+    # ledger is integer); 'usd' = dollars/day. Both null = "rate on request".
+    rate_amount: float | None = Field(default=None, ge=0, le=1_000_000)
+    rate_unit: str | None = Field(default=None)
 
     @field_validator("service_radius_miles")
     @classmethod
@@ -304,6 +319,23 @@ class SitterProfileIn(BaseModel):
         float32 precision, so quantize on the way in — the accepted value is
         exactly the value the DB will hold, with no silent drift."""
         return struct.unpack("f", struct.pack("f", v))[0]
+
+    @model_validator(mode="after")
+    def _rate_pair_and_precision(self) -> "SitterProfileIn":
+        amount, unit = self.rate_amount, self.rate_unit
+        if (amount is None) != (unit is None):
+            raise ValueError("rate_amount and rate_unit must be set together")
+        if unit is not None:
+            if unit not in ("credits", "usd"):
+                raise ValueError("rate_unit must be 'credits' or 'usd'")
+            if unit == "credits" and amount != int(amount):
+                raise ValueError("credits rates must be whole credits")
+            if unit == "usd":
+                # NUMERIC(10,2): reject sub-cent precision rather than silently
+                # rounding the sitter's price.
+                if round(amount, 2) != amount:
+                    raise ValueError("usd rates allow at most 2 decimals")
+        return self
 
 
 class SittingRequestIn(BaseModel):

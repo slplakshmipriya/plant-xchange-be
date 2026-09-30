@@ -2935,6 +2935,18 @@ components:
           type: boolean
           title: Active
           default: true
+        rate_amount:
+          anyOf:
+          - type: number
+            maximum: 1000000.0
+            minimum: 0.0
+          - type: 'null'
+          title: Rate Amount
+        rate_unit:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Rate Unit
       type: object
       title: SitterProfileIn
     SittingIntentIn:
