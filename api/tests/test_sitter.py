@@ -383,13 +383,13 @@ def test_sitter_availability_round_trip(mem_sitting):
     d1 = (date.today() + timedelta(days=3)).isoformat()
     d2 = (date.today() + timedelta(days=5)).isoformat()
     r = client.put("/v1/sitters/me/availability",
-                   json={"unavailable_dates": [d2, d1]}, headers=BOB)
+                   json={"available_dates": [d2, d1]}, headers=BOB)
     assert r.status_code == 200, r.text
-    assert r.json()["unavailable_dates"] == sorted([d1, d2])
+    assert r.json()["available_dates"] == sorted([d1, d2])
     single = client.get("/v1/sitters/bob", headers=ALICE).json()
-    assert single["unavailable_dates"] == sorted([d1, d2])
+    assert single["available_dates"] == sorted([d1, d2])
     listed = client.get("/v1/sitters", headers=ALICE).json()["sitters"]
-    assert listed[0]["unavailable_dates"] == sorted([d1, d2])
+    assert listed[0]["available_dates"] == sorted([d1, d2])
 
 
 def test_sitter_availability_replaces(mem_sitting):
@@ -400,13 +400,13 @@ def test_sitter_availability_replaces(mem_sitting):
     d1 = (date.today() + timedelta(days=3)).isoformat()
     d2 = (date.today() + timedelta(days=5)).isoformat()
     client.put("/v1/sitters/me/availability",
-               json={"unavailable_dates": [d1, d2]}, headers=BOB)
+               json={"available_dates": [d1, d2]}, headers=BOB)
     r = client.put("/v1/sitters/me/availability",
-                   json={"unavailable_dates": [d2]}, headers=BOB)
-    assert r.json()["unavailable_dates"] == [d2]
+                   json={"available_dates": [d2]}, headers=BOB)
+    assert r.json()["available_dates"] == [d2]
     r = client.put("/v1/sitters/me/availability",
-                   json={"unavailable_dates": []}, headers=BOB)
-    assert r.json()["unavailable_dates"] == []
+                   json={"available_dates": []}, headers=BOB)
+    assert r.json()["available_dates"] == []
 
 
 def test_sitter_availability_validation(mem_sitting):
@@ -416,10 +416,10 @@ def test_sitter_availability_validation(mem_sitting):
     from datetime import date, timedelta
     past = (date.today() - timedelta(days=1)).isoformat()
     r = client.put("/v1/sitters/me/availability",
-                   json={"unavailable_dates": [past]}, headers=BOB)
+                   json={"available_dates": [past]}, headers=BOB)
     assert r.status_code == 422, r.text
     r = client.put("/v1/sitters/me/availability",
-                   json={"unavailable_dates": ["not-a-date"]}, headers=BOB)
+                   json={"available_dates": ["not-a-date"]}, headers=BOB)
     assert r.status_code == 422, r.text
 
 
@@ -429,6 +429,6 @@ def test_sitter_availability_requires_sitter_profile(mem_sitting):
     from datetime import date, timedelta
     d1 = (date.today() + timedelta(days=3)).isoformat()
     r = client.put("/v1/sitters/me/availability",
-                   json={"unavailable_dates": [d1]}, headers=BOB)
+                   json={"available_dates": [d1]}, headers=BOB)
     assert r.status_code == 404
     assert r.json()["code"] == "sitter_not_found"

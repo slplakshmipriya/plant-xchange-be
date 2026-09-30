@@ -56,8 +56,8 @@ class SitterRepo(Protocol):
     def upsert_profile(self, uid: str, fields: dict[str, Any]) -> dict[str, Any]: ...
     def get_profile(self, uid: str) -> dict[str, Any] | None: ...
     def list_active(self, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]: ...
-    def set_unavailable_dates(self, uid: str, days: list[str]) -> None: ...
-    def get_unavailable_dates(self, uid: str) -> list[str]: ...
+    def set_available_dates(self, uid: str, days: list[str]) -> None: ...
+    def get_available_dates(self, uid: str) -> list[str]: ...
     def create_request(self, row: dict[str, Any]) -> dict[str, Any]: ...
     def get_request(self, request_id: str) -> dict[str, Any] | None: ...
     def set_request_status(self, request_id: str, status: str,
@@ -71,9 +71,9 @@ def _serialize_profile(row: dict[str, Any], display_name: str | None) -> dict[st
     # rate_amount comes back from Postgres NUMERIC as Decimal — coerce to
     # float so the JSON response carries a plain number.
     amount = row.get("rate_amount")
-    # unavailable_dates may be date objects (Postgres) or ISO strings
+    # available_dates may be date objects (Postgres) or ISO strings
     # (memory repo) — normalize to sorted ISO strings.
-    unavailable = row.get("unavailable_dates") or []
+    available = row.get("available_dates") or []
     return {
         "uid": row["uid"],
         "display_name": display_name,
@@ -84,9 +84,9 @@ def _serialize_profile(row: dict[str, Any], display_name: str | None) -> dict[st
         "rate_amount": float(amount) if amount is not None else None,
         "rate_unit": row.get("rate_unit"),
         "services": list(row.get("services") or []),
-        "unavailable_dates": sorted(
+        "available_dates": sorted(
             d.isoformat() if hasattr(d, "isoformat") else str(d)
-            for d in unavailable),
+            for d in available),
     }
 
 
@@ -143,35 +143,35 @@ class PostgresSitterRepo:
     def get_profile(self, uid):
         row = self._conn.execute(
             """SELECT p.*, COALESCE(array_agg(d.day) FILTER (WHERE d.day IS NOT NULL), '{}')
-                 AS unavailable_dates
+                 AS available_dates
                FROM sitter_profiles p
-               LEFT JOIN sitter_unavailable_dates d ON d.sitter_uid = p.uid
+               LEFT JOIN sitter_available_dates d ON d.sitter_uid = p.uid
                WHERE p.uid = %s GROUP BY p.uid""", (uid,)).fetchone()
         return dict(row) if row else None
 
     def list_active(self, limit=100, offset=0):
         rows = self._conn.execute(
             """SELECT p.*, COALESCE(array_agg(d.day) FILTER (WHERE d.day IS NOT NULL), '{}')
-                 AS unavailable_dates
+                 AS available_dates
                FROM sitter_profiles p
-               LEFT JOIN sitter_unavailable_dates d ON d.sitter_uid = p.uid
+               LEFT JOIN sitter_available_dates d ON d.sitter_uid = p.uid
                WHERE p.active GROUP BY p.uid ORDER BY p.created_at
                LIMIT %s OFFSET %s""",
             (limit, offset)).fetchall()
         return [dict(r) for r in rows]
 
-    def set_unavailable_dates(self, uid, days):
+    def set_available_dates(self, uid, days):
         self._conn.execute(
-            "DELETE FROM sitter_unavailable_dates WHERE sitter_uid = %s", (uid,))
+            "DELETE FROM sitter_available_dates WHERE sitter_uid = %s", (uid,))
         for day in days:
             self._conn.execute(
-                "INSERT INTO sitter_unavailable_dates (sitter_uid, day) VALUES (%s, %s)",
+                "INSERT INTO sitter_available_dates (sitter_uid, day) VALUES (%s, %s)",
                 (uid, day))
         self._conn.commit()
 
-    def get_unavailable_dates(self, uid):
+    def get_available_dates(self, uid):
         rows = self._conn.execute(
-            "SELECT day FROM sitter_unavailable_dates WHERE sitter_uid = %s ORDER BY day",
+            "SELECT day FROM sitter_available_dates WHERE sitter_uid = %s ORDER BY day",
             (uid,)).fetchall()
         return [r["day"].isoformat() for r in rows]
 
@@ -269,7 +269,7 @@ class MemorySitterRepo:
         self._requests: dict[str, dict[str, Any]] = {}
         self._reviews: dict[str, dict[str, Any]] = {}
         self._review_by_sitting: dict[str, str] = {}
-        self._unavailable: dict[str, set[str]] = {}
+        self._available: dict[str, set[str]] = {}
 
     def upsert_profile(self, uid, fields):
         from .listings import utcnow
@@ -294,7 +294,7 @@ class MemorySitterRepo:
         if row is None:
             return None
         out = dict(row)
-        out["unavailable_dates"] = sorted(self._unavailable.get(uid, set()))
+        out["available_dates"] = sorted(self._available.get(uid, set()))
         return out
 
     def list_active(self, limit=100, offset=0):
@@ -302,15 +302,15 @@ class MemorySitterRepo:
         out = []
         for r in active[offset:offset + limit]:
             row = dict(r)
-            row["unavailable_dates"] = sorted(self._unavailable.get(r["uid"], set()))
+            row["available_dates"] = sorted(self._available.get(r["uid"], set()))
             out.append(row)
         return out
 
-    def set_unavailable_dates(self, uid, days):
-        self._unavailable[uid] = set(days)
+    def set_available_dates(self, uid, days):
+        self._available[uid] = set(days)
 
-    def get_unavailable_dates(self, uid):
-        return sorted(self._unavailable.get(uid, set()))
+    def get_available_dates(self, uid):
+        return sorted(self._available.get(uid, set()))
 
     def create_request(self, row):
         from .listings import utcnow
@@ -419,18 +419,18 @@ class SitterProfileIn(BaseModel):
 
 
 class SitterAvailabilityIn(BaseModel):
-    # Dates the sitter is NOT available (ISO YYYY-MM-DD). Replace semantics:
-    # the list fully replaces the sitter's previous unavailable dates.
-    # Absent/empty = open every day.
-    unavailable_dates: list[date] = Field(default_factory=list, max_length=366)
+    # Dates the sitter IS available for plant sitting (ISO YYYY-MM-DD).
+    # Replace semantics: the list fully replaces the sitter's previous
+    # available dates. Absent/empty = no marked availability.
+    available_dates: list[date] = Field(default_factory=list, max_length=366)
 
-    @field_validator("unavailable_dates")
+    @field_validator("available_dates")
     @classmethod
     def _no_past_dates(cls, v: list[date]) -> list[date]:
         today = date.today()
         for d in v:
             if d < today:
-                raise ValueError("unavailable_dates cannot include past dates")
+                raise ValueError("available_dates cannot include past dates")
         return sorted(set(v))
 
 
@@ -475,13 +475,13 @@ def set_my_availability(
     uid: str = Depends(get_current_uid),
     repo: SitterRepo = Depends(get_sitter_repo),
 ) -> dict[str, Any]:
-    """Replace the caller's unavailable dates. Must be a sitter first."""
+    """Replace the caller's available dates. Must be a sitter first."""
     if repo.get_profile(uid) is None:
         raise HTTPException(404, {"code": "sitter_not_found",
                                   "message": "Become a sitter first"})
-    days = [d.isoformat() for d in data.unavailable_dates]
-    repo.set_unavailable_dates(uid, days)
-    return {"unavailable_dates": days}
+    days = [d.isoformat() for d in data.available_dates]
+    repo.set_available_dates(uid, days)
+    return {"available_dates": days}
 
 
 @router.get("/sitters", tags=["sitting"])

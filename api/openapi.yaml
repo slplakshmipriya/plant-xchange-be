@@ -1386,7 +1386,7 @@ paths:
       - sitting
       - sitting
       summary: Set My Availability
-      description: Replace the caller's unavailable dates. Must be a sitter first.
+      description: Replace the caller's available dates. Must be a sitter first.
       operationId: set_my_availability_v1_sitters_me_availability_put
       requestBody:
         content:
@@ -2945,13 +2945,13 @@ components:
       title: SignIn
     SitterAvailabilityIn:
       properties:
-        unavailable_dates:
+        available_dates:
           items:
             type: string
             format: date
           type: array
           maxItems: 366
-          title: Unavailable Dates
+          title: Available Dates
       type: object
       title: SitterAvailabilityIn
     SitterProfileIn:
