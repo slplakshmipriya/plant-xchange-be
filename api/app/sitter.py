@@ -48,6 +48,20 @@ _REQUEST_TRANSITIONS = {
 }
 
 
+def _clean_services(values: list[str]) -> list[str]:
+    """Strip, dedupe, and validate against the fixed taxonomy. Raises
+    ValueError on anything outside SITTER_SERVICES (surfacing as 422)."""
+    seen: list[str] = []
+    for s in values:
+        s = s.strip()
+        if s not in SITTER_SERVICES:
+            raise ValueError(f"unknown service {s!r}; "
+                             f"must be one of {sorted(SITTER_SERVICES)}")
+        if s not in seen:
+            seen.append(s)
+    return seen
+
+
 def can_transition_request(from_status: str, to_status: str) -> bool:
     return to_status in _REQUEST_TRANSITIONS.get(from_status, set())
 
@@ -91,13 +105,18 @@ def _serialize_profile(row: dict[str, Any], display_name: str | None) -> dict[st
 
 
 def _serialize_request(row: dict[str, Any]) -> dict[str, Any]:
+    # dates may be date objects (Postgres DATE[]) or ISO strings (memory
+    # repo) — normalize to a sorted ISO list. services is a plain string list.
+    dates = row.get("dates") or []
     return {
         "id": str(row["id"]),
         "owner_uid": row["owner_uid"],
         "sitter_uid": row["sitter_uid"],
         "plant_count": row["plant_count"],
-        "start_date": str(row["start_date"]),
-        "end_date": str(row["end_date"]),
+        "dates": sorted(
+            d.isoformat() if hasattr(d, "isoformat") else str(d)
+            for d in dates),
+        "services": [str(s) for s in (row.get("services") or [])],
         "notes": row.get("notes", ""),
         "status": row["status"],
         "created_at": row.get("created_at"),
@@ -179,10 +198,11 @@ class PostgresSitterRepo:
         rid = str(uuid.uuid4())
         self._conn.execute(
             """INSERT INTO sitting_requests
-               (id, owner_uid, sitter_uid, plant_count, start_date, end_date, notes)
+               (id, owner_uid, sitter_uid, plant_count, dates, services, notes)
                VALUES (%s,%s,%s,%s,%s,%s,%s)""",
             (rid, row["owner_uid"], row["sitter_uid"], row["plant_count"],
-             row["start_date"], row["end_date"], row.get("notes", "")),
+             list(row["dates"]), list(row.get("services") or []),
+             row.get("notes", "")),
         )
         self._conn.commit()
         return self.get_request(rid)
@@ -193,9 +213,13 @@ class PostgresSitterRepo:
         if not row:
             return None
         d = dict(row)
-        for k in ("start_date", "end_date", "created_at"):
+        for k in ("created_at",):
             v = d.get(k)
             d[k] = v.isoformat() if hasattr(v, "isoformat") else v
+        days = d.get("dates") or []
+        d["dates"] = [x.isoformat() if hasattr(x, "isoformat") else str(x)
+                      for x in days]
+        d["services"] = [str(x) for x in (d.get("services") or [])]
         return d
 
     def set_request_status(self, request_id, status, expected_status):
@@ -317,8 +341,12 @@ class MemorySitterRepo:
         rid = str(uuid.uuid4())
         rec = {
             "id": rid, "owner_uid": row["owner_uid"], "sitter_uid": row["sitter_uid"],
-            "plant_count": row["plant_count"], "start_date": str(row["start_date"]),
-            "end_date": str(row["end_date"]), "notes": row.get("notes", ""),
+            "plant_count": row["plant_count"],
+            "dates": sorted({
+                d.isoformat() if hasattr(d, "isoformat") else str(d)
+                for d in row["dates"]}),
+            "services": [str(s) for s in (row.get("services") or [])],
+            "notes": row.get("notes", ""),
             "status": "requested", "created_at": utcnow().isoformat(),
         }
         self._requests[rid] = rec
@@ -407,15 +435,7 @@ class SitterProfileIn(BaseModel):
     @field_validator("services")
     @classmethod
     def _services_from_taxonomy(cls, v: list[str]) -> list[str]:
-        seen: list[str] = []
-        for s in v:
-            s = s.strip()
-            if s not in SITTER_SERVICES:
-                raise ValueError(f"unknown service {s!r}; "
-                                 f"must be one of {sorted(SITTER_SERVICES)}")
-            if s not in seen:
-                seen.append(s)
-        return seen
+        return _clean_services(v)
 
 
 class SitterAvailabilityIn(BaseModel):
@@ -438,10 +458,20 @@ class SittingRequestIn(BaseModel):
     sitter_uid: str = Field(min_length=1)
     plant_count: int = Field(gt=0, le=500)
     # M12: real dates, not strings — "2026-13-45" fails validation -> 422
-    # instead of reaching the DATE column and 500ing.
-    start_date: date  # YYYY-MM-DD
-    end_date: date
+    # instead of reaching the DATE column and 500ing. Discrete days replace
+    # the old start_date/end_date range: a booking is only valid on days the
+    # sitter marked available (0035 opt-in availability).
+    dates: list[date] = Field(max_length=366)
+    # Which of the sitter's advertised services the owner is requesting.
+    # May be empty only when the sitter advertises none ("services on
+    # request").
+    services: list[str] = Field(default_factory=list, max_length=20)
     notes: str = Field(default="", max_length=2000)
+
+    @field_validator("services")
+    @classmethod
+    def _services_from_taxonomy(cls, v: list[str]) -> list[str]:
+        return _clean_services(v)
 
 
 class ReviewIn(BaseModel):
@@ -554,21 +584,58 @@ def create_sitting_request(
     uid: str = Depends(get_current_uid),
     repo: SitterRepo = Depends(get_sitter_repo),
 ) -> dict[str, Any]:
-    """Request a sitter for your plants. Sitter must be active; not yourself."""
+    """Request a sitter for your plants. Sitter must be active; not yourself.
+
+    Every requested date must be a day the sitter marked available, and the
+    requested services must come from the sitter's advertised set (when the
+    sitter advertises any — at least one is then required).
+    """
     if data.sitter_uid == uid:
         raise HTTPException(422, {"code": "cannot_request_self",
                                   "message": "You cannot request sitting from yourself"})
-    if data.end_date < data.start_date:
+    req_dates = sorted(set(data.dates))
+    if not req_dates:
+        raise HTTPException(422, {"code": "no_dates",
+                                  "message": "Provide at least one sitting date"})
+    today = date.today()
+    past = [d for d in req_dates if d < today]
+    if past:
         raise HTTPException(422, {"code": "invalid_dates",
-                                  "message": "end_date must be on or after start_date"})
+                                  "message": "Sitting dates cannot be in the past: "
+                                             + ", ".join(d.isoformat() for d in past)})
     profile = repo.get_profile(data.sitter_uid)
     if profile is None or not profile.get("active", True):
         raise HTTPException(422, {"code": "sitter_unavailable",
                                   "message": "That sitter is not offering sitting right now"})
+    # 0035 opt-in availability: a request is only valid on days the sitter
+    # marked available. available_dates may be date objects (Postgres) or ISO
+    # strings (memory repo) — normalize to ISO for the comparison.
+    available = {
+        d.isoformat() if hasattr(d, "isoformat") else str(d)
+        for d in (profile.get("available_dates") or [])}
+    unavailable = [d for d in req_dates if d.isoformat() not in available]
+    if unavailable:
+        raise HTTPException(422, {"code": "date_not_available",
+                                  "message": "The sitter is not available on: "
+                                             + ", ".join(d.isoformat()
+                                                         for d in unavailable)})
+    offered = list(profile.get("services") or [])
+    if offered:
+        if not data.services:
+            raise HTTPException(422, {"code": "service_not_offered",
+                                      "message": "This sitter offers services; "
+                                                 "include at least one"})
+        missing = [s for s in data.services if s not in offered]
+        if missing:
+            raise HTTPException(422, {"code": "service_not_offered",
+                                      "message": "The sitter does not offer: "
+                                                 + ", ".join(missing)})
     row = repo.create_request({
         "owner_uid": uid, "sitter_uid": data.sitter_uid,
-        "plant_count": data.plant_count, "start_date": data.start_date,
-        "end_date": data.end_date, "notes": data.notes.strip(),
+        "plant_count": data.plant_count,
+        "dates": [d.isoformat() for d in req_dates],
+        "services": list(data.services),
+        "notes": data.notes.strip(),
     })
     return _serialize_request(row)
 
