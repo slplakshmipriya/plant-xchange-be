@@ -1,8 +1,9 @@
 """Stripe Connect seam + sitting-intent endpoint (API-071).
 
 ``POST /v1/payments/sitting-intent``: the plant owner of an *accepted* sitting
-request asks for a payment hold. The endpoint quotes the booking (subtotal +
-platform fee), creates a PaymentIntent through the configured
+request asks for a payment hold. The endpoint quotes the booking (the customer
+is charged the subtotal; the 18% platform fee is deducted from the sitter's
+payout), creates a PaymentIntent through the configured
 :class:`PaymentGateway`, persists the intent record, and returns the client
 secret the mobile client confirms with the Stripe SDK.
 
@@ -42,9 +43,11 @@ endpoint only talks to the ``PaymentGateway`` protocol.
 
 Fee math: platform fee is 18% of the booking subtotal, rounded half-up to the
 cent (Decimal — Python's banker's ``round()`` is deliberately NOT used for
-money). ``quote_booking`` reads ``subtotal_cents`` off the booking mapping;
-sitting_requests carry no price yet (per-visit pricing lands with the sitter
-track), so it defaults to 0 until a priced booking is passed in.
+money). The fee is borne by the sitter: the customer is charged the subtotal
+only, and the sitter's payout is subtotal − fee. ``quote_booking`` reads
+``subtotal_cents`` off the booking mapping; sitting_requests carry no price
+yet (per-visit pricing lands with the sitter track), so it defaults to 0 until
+a priced booking is passed in.
 """
 
 from __future__ import annotations
@@ -79,7 +82,8 @@ PAYABLE_STATUSES = frozenset({"accepted"})
 # ---------------------------------------------------------------------------
 
 def quote_booking(booking: dict[str, Any]) -> dict[str, int]:
-    """Quote a sitting booking: subtotal + 18% platform fee = total.
+    """Quote a sitting booking: the customer pays the subtotal; the 18%
+    platform fee is deducted from the sitter's payout.
 
     ``booking`` is any mapping carrying ``subtotal_cents`` (the sitter's quoted
     price in cents; defaults to 0 when the booking is not priced yet).
@@ -96,7 +100,8 @@ def quote_booking(booking: dict[str, Any]) -> dict[str, int]:
     return {
         "subtotal_cents": subtotal,
         "fee_cents": fee_cents,
-        "total_cents": subtotal + fee_cents,
+        "customer_total_cents": subtotal,
+        "sitter_payout_cents": subtotal - fee_cents,
     }
 
 
@@ -274,6 +279,10 @@ def create_sitting_intent(
     The caller must be the booking owner; the booking must be in a payable
     state (``accepted``). Idempotent per booking: a retry returns the existing
     intent's client secret instead of creating a second hold.
+
+    Fee semantics: the customer is charged the subtotal only
+    (``customer_total_cents``); the 18% fee is deducted from the sitter's
+    payout and recorded as the sitter-borne fee.
     """
     booking = sitter_repo.get_request(data.bookingId)
     if booking is None:
@@ -306,7 +315,7 @@ def create_sitting_intent(
 
     try:
         pi = gateway.create_payment_intent(
-            amount_cents=quote["total_cents"],
+            amount_cents=quote["customer_total_cents"],
             fee_cents=quote["fee_cents"],
             booking_id=data.bookingId,
         )
@@ -317,7 +326,9 @@ def create_sitting_intent(
     record = payment_repo.create_intent({
         "id": pi["id"],
         "booking_id": data.bookingId,
-        "amount_cents": quote["total_cents"],
+        # The hold charges the customer the subtotal only; the fee is the
+        # sitter-borne cut of the payout.
+        "amount_cents": quote["customer_total_cents"],
         "fee_cents": quote["fee_cents"],
         "client_secret": pi["client_secret"],
     })
