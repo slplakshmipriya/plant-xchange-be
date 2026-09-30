@@ -159,11 +159,37 @@ def test_non_uuid_path_param_returns_404_envelope(client, mock_verify, auth_head
 # ---------------------------------------------------------------------------
 
 
+class _FakePooledConn:
+    """Stand-in for a pooled psycopg connection: records ping/close calls."""
+
+    def __init__(self, pool, fail_ping_times=0, fail_checkout=False):
+        self._pool = pool
+        self.fail_ping_times = fail_ping_times
+        self.fail_checkout = fail_checkout
+        self.pings = 0
+        self.closed = False
+
+    def execute(self, query, *args):
+        self.pings += 1
+        if self.fail_ping_times > 0:
+            self.fail_ping_times -= 1
+            raise OperationalError("connection already closed")
+        return []
+
+    def close(self):
+        self.closed = True
+
+
 class _FakePool:
-    def __init__(self):
+    def __init__(self, fail_ping_times=0, fail_checkout_times=0):
         self.checkouts = 0
         self.exits = 0
         self.closed = False
+        self.conns = []
+        # Scripted failures: first N checkouts hand out dead connections
+        # (ping raises), next M checkouts raise at checkout time.
+        self.fail_ping_times = fail_ping_times
+        self.fail_checkout_times = fail_checkout_times
 
     def connection(self):
         self.checkouts += 1
@@ -171,8 +197,16 @@ class _FakePool:
 
         @contextlib.contextmanager
         def cm():
+            if pool.fail_checkout_times > 0:
+                pool.fail_checkout_times -= 1
+                raise OperationalError("could not connect to server")
+            conn = _FakePooledConn(pool)
+            if pool.fail_ping_times > 0:
+                pool.fail_ping_times -= 1
+                conn.fail_ping_times = 1
+            pool.conns.append(conn)
             try:
-                yield "POOLED-CONN"
+                yield conn
             finally:
                 pool.exits += 1
 
@@ -206,11 +240,68 @@ def test_pool_created_once_and_reused(fake_pool_setup):
 def test_get_db_conn_checks_out_and_returns_connection(fake_pool_setup):
     pool, _ = fake_pool_setup
     gen = db_mod.get_db_conn()
-    assert next(gen) == "POOLED-CONN"
+    conn = next(gen)
+    assert isinstance(conn, _FakePooledConn)
+    assert conn.pings == 1  # checkout validated with SELECT 1
     assert pool.checkouts == 1
     with pytest.raises(StopIteration):
         next(gen)
     assert pool.exits == 1  # returned to the pool on request teardown
+
+
+def test_get_db_conn_discards_stale_connection_and_rechecks_out(monkeypatch):
+    """First checkout hands out a dead connection (Neon suspended while
+    idle): the ping fails, the conn is closed/discarded, and the route
+    transparently gets the second, live checkout."""
+    monkeypatch.setattr(db_mod, "database_url", lambda: "postgresql://fake")
+    pool = _FakePool(fail_ping_times=1)
+    monkeypatch.setattr(db_mod, "_create_pool", lambda url: pool)
+    db_mod._pool = None
+    try:
+        gen = db_mod.get_db_conn()
+        conn = next(gen)
+        assert pool.checkouts == 2
+        assert pool.conns[0].closed  # stale conn discarded, not returned live
+        assert pool.conns[1].pings == 1
+        assert conn is pool.conns[1]
+        with pytest.raises(StopIteration):
+            next(gen)
+    finally:
+        db_mod._pool = None
+
+
+def test_get_db_conn_retries_failed_checkouts_then_503(monkeypatch):
+    """Fresh checkouts themselves fail while Neon is still resuming:
+    retried, then an honest 503 database_waking instead of 500."""
+    monkeypatch.setattr(db_mod, "database_url", lambda: "postgresql://fake")
+    pool = _FakePool(fail_checkout_times=3)
+    monkeypatch.setattr(db_mod, "_create_pool", lambda url: pool)
+    db_mod._pool = None
+    try:
+        with pytest.raises(HTTPException) as ei:
+            next(db_mod.get_db_conn())
+        assert ei.value.status_code == 503
+        assert ei.value.detail["code"] == "database_waking"
+        assert pool.checkouts == 3
+    finally:
+        db_mod._pool = None
+
+
+def test_get_db_conn_does_not_retry_route_errors(monkeypatch):
+    """An OperationalError raised by the route itself (after yield) must
+    propagate — retrying would mistake a half-run route for a bad checkout."""
+    monkeypatch.setattr(db_mod, "database_url", lambda: "postgresql://fake")
+    pool = _FakePool()
+    monkeypatch.setattr(db_mod, "_create_pool", lambda url: pool)
+    db_mod._pool = None
+    try:
+        gen = db_mod.get_db_conn()
+        next(gen)
+        with pytest.raises(OperationalError):
+            gen.throw(OperationalError("server went away mid-request"))
+        assert pool.checkouts == 1  # no retry of the half-run route
+    finally:
+        db_mod._pool = None
 
 
 def test_pool_503_when_database_url_unset(monkeypatch):

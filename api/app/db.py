@@ -207,10 +207,58 @@ def get_db_conn() -> Iterator:
     returned to it when the request finishes, instead of opening a fresh
     ``psycopg.connect()`` (TCP+TLS to Neon) per request.
 
+    Cold-start guard: Neon suspends idle databases, which kills the pooled
+    TCP connections, and psycopg_pool does not validate on checkout — so
+    the first request after a cold spell would check out a dead connection
+    and die with an unhandled OperationalError (500 ``internal_error``).
+    Ping each checkout with ``SELECT 1`` first; on failure close it (so the
+    pool discards it) and re-check out, up to 3 attempts. A fresh checkout's
+    TCP connect normally waits out Neon's resume server-side, so cold
+    starts degrade to latency instead of errors. If the database stays
+    unreachable, fail with 503 ``database_waking`` rather than 500.
+
+    Only checkout/ping failures are retried: once the connection is
+    yielded the route owns it, and its own errors propagate untouched
+    (never retried here — a half-run route must not be mistaken for a
+    bad checkout).
+
     Raises 503 when DATABASE_URL is unset so route handlers fail closed
     instead of crashing. Tests override the per-domain repo factories, so
     they exercise the Memory* repos and never touch this.
     """
+    from psycopg import OperationalError
+
     pool = get_pool()
-    with pool.connection() as conn:
-        yield conn
+    for attempt in range(1, 4):
+        in_route = False
+        try:
+            with pool.connection() as conn:
+                try:
+                    conn.execute("SELECT 1")
+                except OperationalError:
+                    logger.warning(
+                        "db: stale pooled connection, discarding (attempt %d/3)",
+                        attempt,
+                    )
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    continue
+                in_route = True
+                yield conn
+                return
+        except OperationalError as exc:
+            if in_route:
+                # The route itself failed mid-flight — not a checkout
+                # problem; never retry a half-run route.
+                raise
+            logger.warning("db: checkout failed (attempt %d/3): %s", attempt, exc)
+    logger.error("db: unreachable after 3 checkout attempts")
+    raise HTTPException(
+        503,
+        {
+            "code": "database_waking",
+            "message": "The database is waking up — please try again in a moment.",
+        },
+    )
