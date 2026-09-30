@@ -1380,6 +1380,37 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - bearerAuth: []
+  /v1/sitters/me/availability:
+    put:
+      tags:
+      - sitting
+      - sitting
+      summary: Set My Availability
+      description: Replace the caller's unavailable dates. Must be a sitter first.
+      operationId: set_my_availability_v1_sitters_me_availability_put
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SitterAvailabilityIn'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Set My Availability V1 Sitters Me Availability Put
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - bearerAuth: []
   /v1/sitters:
     get:
       tags:
@@ -2912,6 +2943,17 @@ components:
       - content_type
       - size_bytes
       title: SignIn
+    SitterAvailabilityIn:
+      properties:
+        unavailable_dates:
+          items:
+            type: string
+            format: date
+          type: array
+          maxItems: 366
+          title: Unavailable Dates
+      type: object
+      title: SitterAvailabilityIn
     SitterProfileIn:
       properties:
         bio:
@@ -2947,6 +2989,12 @@ components:
           - type: string
           - type: 'null'
           title: Rate Unit
+        services:
+          items:
+            type: string
+          type: array
+          maxItems: 20
+          title: Services
       type: object
       title: SitterProfileIn
     SittingIntentIn:

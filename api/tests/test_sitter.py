@@ -310,3 +310,95 @@ def test_sitter_rate_validation(mem_sitting):
     r = client.put("/v1/sitters/me",
                    json={"rate_amount": -1, "rate_unit": "usd"}, headers=BOB)
     assert r.status_code == 422, r.text
+
+
+def test_sitter_services_round_trip(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, BOB, "Bob")
+    body = _sitter(client, BOB, services=["watering", "repotting"])
+    assert body["services"] == ["watering", "repotting"]
+    single = client.get("/v1/sitters/bob", headers=ALICE).json()
+    assert single["services"] == ["watering", "repotting"]
+    listed = client.get("/v1/sitters", headers=ALICE).json()["sitters"]
+    assert listed[0]["services"] == ["watering", "repotting"]
+
+
+def test_sitter_services_default_empty(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, BOB, "Bob")
+    body = _sitter(client, BOB)
+    assert body["services"] == []
+
+
+def test_sitter_services_reject_unknown(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, BOB, "Bob")
+    r = client.put("/v1/sitters/me", json={"services": ["watering", "teleportation"]},
+                   headers=BOB)
+    assert r.status_code == 422, r.text
+
+
+def test_sitter_services_deduped(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, BOB, "Bob")
+    body = _sitter(client, BOB, services=["watering", "watering", "repotting"])
+    assert body["services"] == ["watering", "repotting"]
+
+
+def test_sitter_availability_round_trip(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, BOB, "Bob")
+    _sitter(client, BOB)
+    from datetime import date, timedelta
+    d1 = (date.today() + timedelta(days=3)).isoformat()
+    d2 = (date.today() + timedelta(days=5)).isoformat()
+    r = client.put("/v1/sitters/me/availability",
+                   json={"unavailable_dates": [d2, d1]}, headers=BOB)
+    assert r.status_code == 200, r.text
+    assert r.json()["unavailable_dates"] == sorted([d1, d2])
+    single = client.get("/v1/sitters/bob", headers=ALICE).json()
+    assert single["unavailable_dates"] == sorted([d1, d2])
+    listed = client.get("/v1/sitters", headers=ALICE).json()["sitters"]
+    assert listed[0]["unavailable_dates"] == sorted([d1, d2])
+
+
+def test_sitter_availability_replaces(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, BOB, "Bob")
+    _sitter(client, BOB)
+    from datetime import date, timedelta
+    d1 = (date.today() + timedelta(days=3)).isoformat()
+    d2 = (date.today() + timedelta(days=5)).isoformat()
+    client.put("/v1/sitters/me/availability",
+               json={"unavailable_dates": [d1, d2]}, headers=BOB)
+    r = client.put("/v1/sitters/me/availability",
+                   json={"unavailable_dates": [d2]}, headers=BOB)
+    assert r.json()["unavailable_dates"] == [d2]
+    r = client.put("/v1/sitters/me/availability",
+                   json={"unavailable_dates": []}, headers=BOB)
+    assert r.json()["unavailable_dates"] == []
+
+
+def test_sitter_availability_validation(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, BOB, "Bob")
+    _sitter(client, BOB)
+    from datetime import date, timedelta
+    past = (date.today() - timedelta(days=1)).isoformat()
+    r = client.put("/v1/sitters/me/availability",
+                   json={"unavailable_dates": [past]}, headers=BOB)
+    assert r.status_code == 422, r.text
+    r = client.put("/v1/sitters/me/availability",
+                   json={"unavailable_dates": ["not-a-date"]}, headers=BOB)
+    assert r.status_code == 422, r.text
+
+
+def test_sitter_availability_requires_sitter_profile(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, BOB, "Bob")
+    from datetime import date, timedelta
+    d1 = (date.today() + timedelta(days=3)).isoformat()
+    r = client.put("/v1/sitters/me/availability",
+                   json={"unavailable_dates": [d1]}, headers=BOB)
+    assert r.status_code == 404
+    assert r.json()["code"] == "sitter_not_found"

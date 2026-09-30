@@ -27,6 +27,18 @@ from .users import UserRepo, get_user_repo
 
 router = APIRouter(prefix="/v1", tags=["sitting"])
 
+# Fixed service taxonomy for sitter profiles. The client renders these as
+# selectable chips; free text is rejected so "Services on reauest" typos
+# can't reach the directory. snake_case on the wire, display names client-side.
+SITTER_SERVICES = (
+    "watering",
+    "repotting",
+    "fertilizing",
+    "pruning",
+    "pest_control",
+    "vacation_care",
+)
+
 _REQUEST_TRANSITIONS = {
     "requested": {"accepted", "declined", "cancelled"},
     "accepted": {"completed", "cancelled"},
@@ -44,6 +56,8 @@ class SitterRepo(Protocol):
     def upsert_profile(self, uid: str, fields: dict[str, Any]) -> dict[str, Any]: ...
     def get_profile(self, uid: str) -> dict[str, Any] | None: ...
     def list_active(self, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]: ...
+    def set_unavailable_dates(self, uid: str, days: list[str]) -> None: ...
+    def get_unavailable_dates(self, uid: str) -> list[str]: ...
     def create_request(self, row: dict[str, Any]) -> dict[str, Any]: ...
     def get_request(self, request_id: str) -> dict[str, Any] | None: ...
     def set_request_status(self, request_id: str, status: str,
@@ -57,6 +71,9 @@ def _serialize_profile(row: dict[str, Any], display_name: str | None) -> dict[st
     # rate_amount comes back from Postgres NUMERIC as Decimal — coerce to
     # float so the JSON response carries a plain number.
     amount = row.get("rate_amount")
+    # unavailable_dates may be date objects (Postgres) or ISO strings
+    # (memory repo) — normalize to sorted ISO strings.
+    unavailable = row.get("unavailable_dates") or []
     return {
         "uid": row["uid"],
         "display_name": display_name,
@@ -66,6 +83,10 @@ def _serialize_profile(row: dict[str, Any], display_name: str | None) -> dict[st
         "active": row.get("active", True),
         "rate_amount": float(amount) if amount is not None else None,
         "rate_unit": row.get("rate_unit"),
+        "services": list(row.get("services") or []),
+        "unavailable_dates": sorted(
+            d.isoformat() if hasattr(d, "isoformat") else str(d)
+            for d in unavailable),
     }
 
 
@@ -101,33 +122,58 @@ class PostgresSitterRepo:
     def upsert_profile(self, uid, fields):
         row = self._conn.execute(
             """INSERT INTO sitter_profiles (uid, bio, experience_years, service_radius_miles, active,
-                                            rate_amount, rate_unit)
-               VALUES (%s,%s,%s,%s,%s,%s,%s)
+                                            rate_amount, rate_unit, services)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (uid) DO UPDATE SET
                  bio = EXCLUDED.bio, experience_years = EXCLUDED.experience_years,
                  service_radius_miles = EXCLUDED.service_radius_miles,
                  active = EXCLUDED.active,
                  rate_amount = EXCLUDED.rate_amount, rate_unit = EXCLUDED.rate_unit,
+                 services = EXCLUDED.services,
                  updated_at = now()
                RETURNING *""",
             (uid, fields.get("bio", ""), fields.get("experience_years", 0),
              fields.get("service_radius_miles", 5), fields.get("active", True),
-             fields.get("rate_amount"), fields.get("rate_unit")),
+             fields.get("rate_amount"), fields.get("rate_unit"),
+             list(fields.get("services") or [])),
         ).fetchone()
         self._conn.commit()
         return dict(row)
 
     def get_profile(self, uid):
         row = self._conn.execute(
-            "SELECT * FROM sitter_profiles WHERE uid = %s", (uid,)).fetchone()
+            """SELECT p.*, COALESCE(array_agg(d.day) FILTER (WHERE d.day IS NOT NULL), '{}')
+                 AS unavailable_dates
+               FROM sitter_profiles p
+               LEFT JOIN sitter_unavailable_dates d ON d.sitter_uid = p.uid
+               WHERE p.uid = %s GROUP BY p.uid""", (uid,)).fetchone()
         return dict(row) if row else None
 
     def list_active(self, limit=100, offset=0):
         rows = self._conn.execute(
-            "SELECT * FROM sitter_profiles WHERE active ORDER BY created_at "
-            "LIMIT %s OFFSET %s",
+            """SELECT p.*, COALESCE(array_agg(d.day) FILTER (WHERE d.day IS NOT NULL), '{}')
+                 AS unavailable_dates
+               FROM sitter_profiles p
+               LEFT JOIN sitter_unavailable_dates d ON d.sitter_uid = p.uid
+               WHERE p.active GROUP BY p.uid ORDER BY p.created_at
+               LIMIT %s OFFSET %s""",
             (limit, offset)).fetchall()
         return [dict(r) for r in rows]
+
+    def set_unavailable_dates(self, uid, days):
+        self._conn.execute(
+            "DELETE FROM sitter_unavailable_dates WHERE sitter_uid = %s", (uid,))
+        for day in days:
+            self._conn.execute(
+                "INSERT INTO sitter_unavailable_dates (sitter_uid, day) VALUES (%s, %s)",
+                (uid, day))
+        self._conn.commit()
+
+    def get_unavailable_dates(self, uid):
+        rows = self._conn.execute(
+            "SELECT day FROM sitter_unavailable_dates WHERE sitter_uid = %s ORDER BY day",
+            (uid,)).fetchall()
+        return [r["day"].isoformat() for r in rows]
 
     def create_request(self, row):
         rid = str(uuid.uuid4())
@@ -223,6 +269,7 @@ class MemorySitterRepo:
         self._requests: dict[str, dict[str, Any]] = {}
         self._reviews: dict[str, dict[str, Any]] = {}
         self._review_by_sitting: dict[str, str] = {}
+        self._unavailable: dict[str, set[str]] = {}
 
     def upsert_profile(self, uid, fields):
         from .listings import utcnow
@@ -235,6 +282,7 @@ class MemorySitterRepo:
             "active": fields.get("active", row.get("active", True)),
             "rate_amount": fields.get("rate_amount", row.get("rate_amount")),
             "rate_unit": fields.get("rate_unit", row.get("rate_unit")),
+            "services": list(fields.get("services", row.get("services", []))),
             "created_at": row.get("created_at", utcnow().isoformat()),
             "updated_at": utcnow().isoformat(),
         })
@@ -243,11 +291,26 @@ class MemorySitterRepo:
 
     def get_profile(self, uid):
         row = self._profiles.get(uid)
-        return dict(row) if row else None
+        if row is None:
+            return None
+        out = dict(row)
+        out["unavailable_dates"] = sorted(self._unavailable.get(uid, set()))
+        return out
 
     def list_active(self, limit=100, offset=0):
         active = [r for r in self._profiles.values() if r.get("active", True)]
-        return [dict(r) for r in active[offset:offset + limit]]
+        out = []
+        for r in active[offset:offset + limit]:
+            row = dict(r)
+            row["unavailable_dates"] = sorted(self._unavailable.get(r["uid"], set()))
+            out.append(row)
+        return out
+
+    def set_unavailable_dates(self, uid, days):
+        self._unavailable[uid] = set(days)
+
+    def get_unavailable_dates(self, uid):
+        return sorted(self._unavailable.get(uid, set()))
 
     def create_request(self, row):
         from .listings import utcnow
@@ -311,6 +374,9 @@ class SitterProfileIn(BaseModel):
     # ledger is integer); 'usd' = dollars/day. Both null = "rate on request".
     rate_amount: float | None = Field(default=None, ge=0, le=1_000_000)
     rate_unit: str | None = Field(default=None)
+    # Services the sitter offers, from the fixed taxonomy below.
+    # Empty = "on request".
+    services: list[str] = Field(default_factory=list, max_length=20)
 
     @field_validator("service_radius_miles")
     @classmethod
@@ -336,6 +402,35 @@ class SitterProfileIn(BaseModel):
                 if round(amount, 2) != amount:
                     raise ValueError("usd rates allow at most 2 decimals")
         return self
+
+    @field_validator("services")
+    @classmethod
+    def _services_from_taxonomy(cls, v: list[str]) -> list[str]:
+        seen: list[str] = []
+        for s in v:
+            s = s.strip()
+            if s not in SITTER_SERVICES:
+                raise ValueError(f"unknown service {s!r}; "
+                                 f"must be one of {sorted(SITTER_SERVICES)}")
+            if s not in seen:
+                seen.append(s)
+        return seen
+
+
+class SitterAvailabilityIn(BaseModel):
+    # Dates the sitter is NOT available (ISO YYYY-MM-DD). Replace semantics:
+    # the list fully replaces the sitter's previous unavailable dates.
+    # Absent/empty = open every day.
+    unavailable_dates: list[date] = Field(default_factory=list, max_length=366)
+
+    @field_validator("unavailable_dates")
+    @classmethod
+    def _no_past_dates(cls, v: list[date]) -> list[date]:
+        today = date.today()
+        for d in v:
+            if d < today:
+                raise ValueError("unavailable_dates cannot include past dates")
+        return sorted(set(v))
 
 
 class SittingRequestIn(BaseModel):
@@ -371,6 +466,21 @@ def upsert_sitter_profile(
                                   "message": "Create a profile (POST /v1/users) first"})
     row = repo.upsert_profile(uid, data.model_dump())
     return _serialize_profile(row, _display_name(user_repo, uid))
+
+
+@router.put("/sitters/me/availability", tags=["sitting"])
+def set_my_availability(
+    data: SitterAvailabilityIn,
+    uid: str = Depends(get_current_uid),
+    repo: SitterRepo = Depends(get_sitter_repo),
+) -> dict[str, Any]:
+    """Replace the caller's unavailable dates. Must be a sitter first."""
+    if repo.get_profile(uid) is None:
+        raise HTTPException(404, {"code": "sitter_not_found",
+                                  "message": "Become a sitter first"})
+    days = [d.isoformat() for d in data.unavailable_dates]
+    repo.set_unavailable_dates(uid, days)
+    return {"unavailable_dates": days}
 
 
 @router.get("/sitters", tags=["sitting"])
