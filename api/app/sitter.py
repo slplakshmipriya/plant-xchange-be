@@ -246,7 +246,7 @@ class PostgresSitterRepo:
         rows = self._conn.execute(
             """SELECT r.* FROM sitting_reviews r
                JOIN sitting_requests s ON s.id = r.sitting_id
-               WHERE s.sitter_uid = %s ORDER BY r.created_at""",
+               WHERE s.sitter_uid = %s ORDER BY r.created_at DESC""",
             (sitter_uid,)).fetchall()
         return [_review_row(r) for r in rows]
 
@@ -358,7 +358,8 @@ class MemorySitterRepo:
     def list_reviews_for_sitter(self, sitter_uid):
         out = [r for r in self._reviews.values()
                if self._requests.get(r["sitting_id"], {}).get("sitter_uid") == sitter_uid]
-        return [dict(r) for r in sorted(out, key=lambda r: r["created_at"])]
+        return [dict(r) for r in sorted(out, key=lambda r: r["created_at"],
+                                         reverse=True)]
 
 
 def get_sitter_repo(conn=Depends(get_db_conn)) -> SitterRepo:

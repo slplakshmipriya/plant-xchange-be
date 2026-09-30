@@ -104,6 +104,36 @@ def test_full_sitting_lifecycle_with_review(mem_sitting):
     assert body["reviews"][0]["comment"] == "Plants thrived!"
 
 
+def test_sitter_reviews_latest_first(mem_sitting):
+    # Reviews on the public list come back newest first.
+    client, _, srepo = mem_sitting
+    _profile(client, ALICE, "Alice")
+    _profile(client, BOB, "Bob")
+    _sitter(client, BOB)
+
+    first = _request(client, ALICE)
+    client.post(f"/v1/sitting-requests/{first['id']}/accept", headers=BOB)
+    client.post(f"/v1/sitting-requests/{first['id']}/complete", headers=BOB)
+    r1 = client.post(f"/v1/sitting-requests/{first['id']}/reviews",
+                     json={"rating": 4, "comment": "Older"}, headers=ALICE)
+    assert r1.status_code == 201, r1.text
+
+    second = _request(client, ALICE)
+    client.post(f"/v1/sitting-requests/{second['id']}/accept", headers=BOB)
+    client.post(f"/v1/sitting-requests/{second['id']}/complete", headers=BOB)
+    r2 = client.post(f"/v1/sitting-requests/{second['id']}/reviews",
+                     json={"rating": 5, "comment": "Newer"}, headers=ALICE)
+    assert r2.status_code == 201, r2.text
+
+    # Both reviews are created within the same test tick, so pin the first
+    # one to an older timestamp to force a known ordering.
+    srepo._reviews[r1.json()["id"]]["created_at"] = "2026-01-01T00:00:00+00:00"
+
+    body = client.get("/v1/sitters/bob/reviews", headers=ALICE).json()
+    assert [r["id"] for r in body["reviews"]] == [r2.json()["id"], r1.json()["id"]]
+    assert [r["comment"] for r in body["reviews"]] == ["Newer", "Older"]
+
+
 def test_request_rules(mem_sitting):
     client, _, _ = mem_sitting
     _profile(client, ALICE, "Alice")
