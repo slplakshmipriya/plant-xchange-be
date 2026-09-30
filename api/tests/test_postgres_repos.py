@@ -286,11 +286,14 @@ def test_sitter_roundtrip(pg_conn, users):
         "owner_uid": "pg-alice",
         "sitter_uid": "pg-bob",
         "plant_count": 3,
-        "start_date": date(2026, 10, 5),
-        "end_date": date(2026, 10, 8),
+        "dates": [date(2026, 10, 5), date(2026, 10, 6),
+                  date(2026, 10, 7), date(2026, 10, 8)],
+        "services": ["watering"],
     })
     assert req["status"] == "requested"
-    assert req["start_date"] == "2026-10-05"
+    assert req["dates"] == ["2026-10-05", "2026-10-06",
+                            "2026-10-07", "2026-10-08"]
+    assert req["services"] == ["watering"]
     assert repo.get_request(req["id"])["plant_count"] == 3
     assert repo.set_request_status(req["id"], "accepted", "requested")["status"] == "accepted"
 
@@ -302,8 +305,8 @@ def test_payments_roundtrip(pg_conn, users):
         "owner_uid": "pg-alice",
         "sitter_uid": "pg-bob",
         "plant_count": 2,
-        "start_date": date(2026, 10, 5),
-        "end_date": date(2026, 10, 6),
+        "dates": [date(2026, 10, 5), date(2026, 10, 6)],
+        "services": [],
     })
     intent = pay_repo.create_intent({
         "id": "pi_test_1",

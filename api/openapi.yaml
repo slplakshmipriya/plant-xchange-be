@@ -1541,7 +1541,14 @@ paths:
       - sitting
       - sitting
       summary: Create Sitting Request
-      description: Request a sitter for your plants. Sitter must be active; not yourself.
+      description: 'Request a sitter for your plants. Sitter must be active; not yourself.
+
+
+        Every requested date must be a day the sitter marked available, and the
+
+        requested services must come from the sitter''s advertised set (when the
+
+        sitter advertises any — at least one is then required).'
       operationId: create_sitting_request_v1_sitting_requests_post
       requestBody:
         content:
@@ -2179,7 +2186,14 @@ paths:
 
         state (``accepted``). Idempotent per booking: a retry returns the existing
 
-        intent''s client secret instead of creating a second hold.'
+        intent''s client secret instead of creating a second hold.
+
+
+        Fee semantics: the customer is charged the subtotal only
+
+        (``customer_total_cents``); the 18% fee is deducted from the sitter''s
+
+        payout and recorded as the sitter-borne fee.'
       operationId: create_sitting_intent_v1_payments_sitting_intent_post
       requestBody:
         content:
@@ -3018,14 +3032,19 @@ components:
           maximum: 500.0
           exclusiveMinimum: 0.0
           title: Plant Count
-        start_date:
-          type: string
-          format: date
-          title: Start Date
-        end_date:
-          type: string
-          format: date
-          title: End Date
+        dates:
+          items:
+            type: string
+            format: date
+          type: array
+          maxItems: 366
+          title: Dates
+        services:
+          items:
+            type: string
+          type: array
+          maxItems: 20
+          title: Services
         notes:
           type: string
           maxLength: 2000
@@ -3035,8 +3054,7 @@ components:
       required:
       - sitter_uid
       - plant_count
-      - start_date
-      - end_date
+      - dates
       title: SittingRequestIn
     SlotIn:
       properties:

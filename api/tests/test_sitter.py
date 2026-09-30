@@ -49,10 +49,24 @@ def _sitter(client, headers, **kw):
     return r.json()
 
 
-def _request(client, headers, sitter_uid="bob"):
+def _avail(client, sitter_headers, days):
+    r = client.put("/v1/sitters/me/availability",
+                   json={"available_dates": days}, headers=sitter_headers)
+    assert r.status_code == 200, r.text
+
+
+def _future_days(offset=10, count=6):
+    from datetime import date, timedelta
+    return [(date.today() + timedelta(days=offset + i)).isoformat()
+            for i in range(count)]
+
+
+def _request(client, headers, sitter_uid="bob", sitter_headers=BOB, services=()):
+    days = _future_days()
+    _avail(client, sitter_headers, days)
     r = client.post("/v1/sitting-requests", json={
         "sitter_uid": sitter_uid, "plant_count": 12,
-        "start_date": "2026-10-10", "end_date": "2026-10-15",
+        "dates": days[:3], "services": list(services),
         "notes": "Water the tomatoes daily.",
     }, headers=headers)
     assert r.status_code == 201, r.text
@@ -139,11 +153,12 @@ def test_request_rules(mem_sitting):
     _profile(client, ALICE, "Alice")
     _profile(client, BOB, "Bob")
     _profile(client, MALLORY, "Mallory")
+    days = _future_days()
 
     # Cannot request yourself.
     r = client.post("/v1/sitting-requests", json={
         "sitter_uid": "alice", "plant_count": 3,
-        "start_date": "2026-10-10", "end_date": "2026-10-12"}, headers=ALICE)
+        "dates": days[:2]}, headers=ALICE)
     assert r.status_code == 422
     assert r.json()["code"] == "cannot_request_self"
 
@@ -151,17 +166,16 @@ def test_request_rules(mem_sitting):
     _sitter(client, MALLORY, active=False)
     r = client.post("/v1/sitting-requests", json={
         "sitter_uid": "mallory", "plant_count": 3,
-        "start_date": "2026-10-10", "end_date": "2026-10-12"}, headers=ALICE)
+        "dates": days[:2]}, headers=ALICE)
     assert r.status_code == 422
     assert r.json()["code"] == "sitter_unavailable"
 
-    # Bad dates.
+    # Dates must be non-empty.
     _sitter(client, BOB)
     r = client.post("/v1/sitting-requests", json={
-        "sitter_uid": "bob", "plant_count": 3,
-        "start_date": "2026-10-12", "end_date": "2026-10-10"}, headers=ALICE)
+        "sitter_uid": "bob", "plant_count": 3, "dates": []}, headers=ALICE)
     assert r.status_code == 422
-    assert r.json()["code"] == "invalid_dates"
+    assert r.json()["code"] == "no_dates"
 
 
 def test_lifecycle_permissions_and_transitions(mem_sitting):
@@ -246,19 +260,21 @@ def test_sitting_request_rejects_impossible_date(mem_sitting):
     _profile(client, ALICE, "Alice")
     _profile(client, BOB, "Bob")
     _sitter(client, BOB)
+    days = _future_days()
+    _avail(client, BOB, days)
 
     for bad in ("2026-13-45", "2026-02-30", "10/10/2026", "not-a-date"):
         r = client.post("/v1/sitting-requests", json={
             "sitter_uid": "bob", "plant_count": 3,
-            "start_date": bad, "end_date": "2026-10-12"}, headers=ALICE)
+            "dates": [bad, days[0]]}, headers=ALICE)
         assert r.status_code == 422, (bad, r.text)
 
     # A real date still works.
     r = client.post("/v1/sitting-requests", json={
         "sitter_uid": "bob", "plant_count": 3,
-        "start_date": "2026-10-10", "end_date": "2026-10-12"}, headers=ALICE)
+        "dates": days[:2]}, headers=ALICE)
     assert r.status_code == 201, r.text
-    assert r.json()["start_date"] == "2026-10-10"
+    assert r.json()["dates"] == sorted(days[:2])
 
 
 def test_service_radius_quantized_to_float32(mem_sitting):
@@ -432,3 +448,167 @@ def test_sitter_availability_requires_sitter_profile(mem_sitting):
                    json={"available_dates": [d1]}, headers=BOB)
     assert r.status_code == 404
     assert r.json()["code"] == "sitter_not_found"
+
+
+# ---------------------------------------------------------------------------
+# 0036: discrete dates + per-request services on sitting requests
+# ---------------------------------------------------------------------------
+
+def test_sitting_request_rejects_past_date(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, ALICE, "Alice")
+    _profile(client, BOB, "Bob")
+    _sitter(client, BOB)
+    from datetime import date, timedelta
+    past = (date.today() - timedelta(days=1)).isoformat()
+    future = _future_days()
+    _avail(client, BOB, future)
+    r = client.post("/v1/sitting-requests", json={
+        "sitter_uid": "bob", "plant_count": 3,
+        "dates": [past, future[0]]}, headers=ALICE)
+    assert r.status_code == 422
+    assert r.json()["code"] == "invalid_dates"
+
+
+def test_sitting_request_rejects_date_not_available(mem_sitting):
+    # Availability is opt-in (0035): a request for a day the sitter did not
+    # mark available is 422, even when the day is in the future.
+    client, _, _ = mem_sitting
+    _profile(client, ALICE, "Alice")
+    _profile(client, BOB, "Bob")
+    _sitter(client, BOB)
+    days = _future_days()
+    _avail(client, BOB, days[:2])
+    r = client.post("/v1/sitting-requests", json={
+        "sitter_uid": "bob", "plant_count": 3,
+        "dates": days[:3]}, headers=ALICE)
+    assert r.status_code == 422
+    assert r.json()["code"] == "date_not_available"
+
+
+def test_sitting_request_dates_sorted_and_deduped(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, ALICE, "Alice")
+    _profile(client, BOB, "Bob")
+    _sitter(client, BOB)
+    days = _future_days()
+    _avail(client, BOB, days)
+    r = client.post("/v1/sitting-requests", json={
+        "sitter_uid": "bob", "plant_count": 3,
+        "dates": [days[2], days[0], days[2], days[1]]}, headers=ALICE)
+    assert r.status_code == 201, r.text
+    assert r.json()["dates"] == sorted(days[:3])
+
+
+def test_sitting_request_services_required_when_advertised(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, ALICE, "Alice")
+    _profile(client, BOB, "Bob")
+    _sitter(client, BOB, services=["watering", "repotting"])
+    days = _future_days()
+    _avail(client, BOB, days)
+    r = client.post("/v1/sitting-requests", json={
+        "sitter_uid": "bob", "plant_count": 3,
+        "dates": days[:2], "services": []}, headers=ALICE)
+    assert r.status_code == 422
+    assert r.json()["code"] == "service_not_offered"
+
+
+def test_sitting_request_services_must_be_within_advertised(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, ALICE, "Alice")
+    _profile(client, BOB, "Bob")
+    _sitter(client, BOB, services=["watering", "repotting"])
+    days = _future_days()
+    _avail(client, BOB, days)
+    # pest_control is a real service but bob doesn't advertise it.
+    r = client.post("/v1/sitting-requests", json={
+        "sitter_uid": "bob", "plant_count": 3,
+        "dates": days[:2], "services": ["watering", "pest_control"]}, headers=ALICE)
+    assert r.status_code == 422
+    assert r.json()["code"] == "service_not_offered"
+
+
+def test_sitting_request_services_echo_when_valid(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, ALICE, "Alice")
+    _profile(client, BOB, "Bob")
+    _sitter(client, BOB, services=["watering", "repotting"])
+    days = _future_days()
+    _avail(client, BOB, days)
+    r = client.post("/v1/sitting-requests", json={
+        "sitter_uid": "bob", "plant_count": 3,
+        "dates": days[:2], "services": ["repotting", "watering"]}, headers=ALICE)
+    assert r.status_code == 201, r.text
+    assert r.json()["services"] == ["repotting", "watering"]
+
+
+def test_sitting_request_services_optional_when_sitter_has_none(mem_sitting):
+    # The sitter advertises nothing ("services on request") — services may be
+    # omitted entirely.
+    client, _, _ = mem_sitting
+    _profile(client, ALICE, "Alice")
+    _profile(client, BOB, "Bob")
+    _sitter(client, BOB)
+    days = _future_days()
+    _avail(client, BOB, days)
+    r = client.post("/v1/sitting-requests", json={
+        "sitter_uid": "bob", "plant_count": 3,
+        "dates": days[:2]}, headers=ALICE)
+    assert r.status_code == 201, r.text
+    assert r.json()["services"] == []
+
+
+def test_sitting_request_services_reject_unknown(mem_sitting):
+    client, _, _ = mem_sitting
+    _profile(client, ALICE, "Alice")
+    _profile(client, BOB, "Bob")
+    _sitter(client, BOB)
+    days = _future_days()
+    _avail(client, BOB, days)
+    r = client.post("/v1/sitting-requests", json={
+        "sitter_uid": "bob", "plant_count": 3,
+        "dates": days[:2], "services": ["teleportation"]}, headers=ALICE)
+    assert r.status_code == 422, r.text
+
+
+def test_sitter_profile_update_accepts_services(mem_sitting):
+    # PUT /v1/sitters/me already accepts services (migration 0034).
+    client, _, _ = mem_sitting
+    _profile(client, BOB, "Bob")
+    body = _sitter(client, BOB, services=["watering"])
+    assert body["services"] == ["watering"]
+
+
+def test_bookings_list_returns_dates_and_services(mem_sitting):
+    # GET /v1/bookings talks to Postgres directly (no memory-repo path), so
+    # exercise it with a scripted connection carrying PG-shaped rows: DATE[]
+    # arrives as a list of date objects.
+    from datetime import date
+    from app import db as db_mod
+
+    client, _, _ = mem_sitting
+    d0, d1 = date(2026, 10, 10), date(2026, 10, 12)
+
+    class _Cursor:
+        def fetchall(self):
+            return [{
+                "id": "req-1", "owner_uid": "alice", "sitter_uid": "bob",
+                "plant_count": 4, "dates": [d1, d0], "services": ["watering"],
+                "notes": "", "status": "requested",
+                "created_at": "2026-09-30T00:00:00+00:00",
+            }]
+
+    class _Conn:
+        def execute(self, sql, params=()):
+            return _Cursor()
+
+    client.app.dependency_overrides[db_mod.get_db_conn] = lambda: _Conn()
+    body = client.get("/v1/bookings", headers=ALICE).json()
+    assert len(body["bookings"]) == 1
+    b = body["bookings"][0]
+    assert b["id"] == "req-1"
+    assert b["dates"] == ["2026-10-10", "2026-10-12"]
+    assert b["services"] == ["watering"]
+    assert "start_date" not in b
+    assert "end_date" not in b

@@ -62,8 +62,9 @@ class _FakeConn:
 def _request_row(**kw):
     row = {
         "id": "req-1", "owner_uid": "owner", "sitter_uid": "sitter",
-        "plant_count": 2, "start_date": date(2026, 10, 1),
-        "end_date": date(2026, 10, 3), "notes": "",
+        "plant_count": 2,
+        "dates": [date(2026, 10, 1), date(2026, 10, 2), date(2026, 10, 3)],
+        "services": ["watering"], "notes": "",
         "status": "requested", "created_at": NOW,
     }
     row.update(kw)
@@ -79,7 +80,9 @@ def test_pg_set_request_status_is_conditional():
     repo = sitter_mod.PostgresSitterRepo(conn)
     out = repo.set_request_status("req-1", "accepted", "requested")
     assert out["status"] == "accepted"
-    assert out["start_date"] == "2026-10-01"  # DATE -> ISO through the re-read
+    # DATE[] -> sorted ISO through the re-read.
+    assert out["dates"] == ["2026-10-01", "2026-10-02", "2026-10-03"]
+    assert out["services"] == ["watering"]
     sql, params = conn.statements[0]
     assert "WHERE id = %s AND status = %s" in " ".join(sql.split())
     assert params == ("accepted", "req-1", "requested")
@@ -99,7 +102,7 @@ def test_memory_set_request_status_rejects_stale_expected():
     repo = sitter_mod.MemorySitterRepo()
     rec = repo.create_request({
         "owner_uid": "o", "sitter_uid": "s", "plant_count": 1,
-        "start_date": "2026-10-01", "end_date": "2026-10-02"})
+        "dates": ["2026-10-01", "2026-10-02"], "services": []})
     repo.set_request_status(rec["id"], "accepted", "requested")
     # A second actor acting on the stale "requested" read loses.
     with pytest.raises(HTTPException) as ei:

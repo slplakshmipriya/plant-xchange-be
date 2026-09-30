@@ -55,6 +55,9 @@ def _setup_booking(client, urepo, srepo, price_cents: int | None = 10000,
     Paid sitting bookings require IDV (M20a): alice is verified by default;
     pass ``idv_verified=False`` to exercise the 403 path.
     """
+    from datetime import date, timedelta
+    days = [(date.today() + timedelta(days=10 + i)).isoformat()
+            for i in range(6)]
     for headers, name in ((ALICE, "Alice"), (BOB, "Bob")):
         r = client.post("/v1/users", json={"display_name": name, "age_attestation": True}, headers=headers)
         assert r.status_code == 200, r.text
@@ -62,9 +65,12 @@ def _setup_booking(client, urepo, srepo, price_cents: int | None = 10000,
         urepo.set_idv_status("alice", "verified")
     r = client.put("/v1/sitters/me", json={"bio": "tomato whisperer"}, headers=BOB)
     assert r.status_code == 200, r.text
+    r = client.put("/v1/sitters/me/availability",
+                   json={"available_dates": days}, headers=BOB)
+    assert r.status_code == 200, r.text
     r = client.post("/v1/sitting-requests", json={
         "sitter_uid": "bob", "plant_count": 4,
-        "start_date": "2026-10-10", "end_date": "2026-10-15"}, headers=ALICE)
+        "dates": days[:3], "services": []}, headers=ALICE)
     assert r.status_code == 201, r.text
     req = r.json()
     if price_cents is not None:
@@ -81,14 +87,18 @@ def _setup_booking(client, urepo, srepo, price_cents: int | None = 10000,
 # ---------------------------------------------------------------------------
 
 def test_quote_exact():
+    # The customer is charged the subtotal only; the 18% fee is deducted
+    # from the sitter's payout.
     assert payments_mod.quote_booking({"subtotal_cents": 10000}) == {
-        "subtotal_cents": 10000, "fee_cents": 1800, "total_cents": 11800}
+        "subtotal_cents": 10000, "fee_cents": 1800,
+        "customer_total_cents": 10000, "sitter_payout_cents": 8200}
 
 
 def test_quote_zero_and_missing():
     assert payments_mod.quote_booking({"subtotal_cents": 0}) == {
-        "subtotal_cents": 0, "fee_cents": 0, "total_cents": 0}
-    assert payments_mod.quote_booking({})["total_cents"] == 0
+        "subtotal_cents": 0, "fee_cents": 0,
+        "customer_total_cents": 0, "sitter_payout_cents": 0}
+    assert payments_mod.quote_booking({})["customer_total_cents"] == 0
 
 
 def test_quote_rounds_half_up_not_bankers():
@@ -103,7 +113,17 @@ def test_quote_rounding_edges():
     # 199 * 0.18 = 35.82 exactly; float math gives 35.81999... -> Decimal wins.
     assert payments_mod.quote_booking({"subtotal_cents": 199})["fee_cents"] == 36
     assert payments_mod.quote_booking({"subtotal_cents": 99999999}) == {
-        "subtotal_cents": 99999999, "fee_cents": 18000000, "total_cents": 117999999}
+        "subtotal_cents": 99999999, "fee_cents": 18000000,
+        "customer_total_cents": 99999999, "sitter_payout_cents": 81999999}
+
+
+def test_quote_customer_total_is_subtotal():
+    # The fee flip: customer_total == subtotal, sitter_payout == subtotal - fee.
+    for subtotal in (0, 1, 25, 100, 10000, 99999999):
+        q = payments_mod.quote_booking({"subtotal_cents": subtotal})
+        assert q["customer_total_cents"] == subtotal
+        assert q["sitter_payout_cents"] == subtotal - q["fee_cents"]
+        assert "total_cents" not in q  # old customer-subtotal+fee semantics gone
 
 
 @pytest.mark.parametrize("bad", [-1, -100, "100", None, 10.5, True])
@@ -191,9 +211,15 @@ def test_intent_409_not_payable(mem_payments, end_state):
                            headers=headers).status_code == 200
     urepo.set_idv_status("alice", "verified")  # M20a gate: verify before 409 check
     assert client.put("/v1/sitters/me", json={}, headers=BOB).status_code == 200
+    from datetime import date, timedelta
+    days = [(date.today() + timedelta(days=10 + i)).isoformat()
+            for i in range(6)]
+    r = client.put("/v1/sitters/me/availability",
+                   json={"available_dates": days}, headers=BOB)
+    assert r.status_code == 200, r.text
     r = client.post("/v1/sitting-requests", json={
         "sitter_uid": "bob", "plant_count": 2,
-        "start_date": "2026-10-10", "end_date": "2026-10-12"}, headers=ALICE)
+        "dates": days[:3], "services": []}, headers=ALICE)
     req = r.json()
     if end_state in ("declined",):
         client.post(f"/v1/sitting-requests/{req['id']}/decline", headers=BOB)
@@ -222,19 +248,39 @@ def test_sitting_intent_stub_shape(mem_payments):
                     json={"bookingId": req["id"]}, headers=ALICE)
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["clientSecret"] == f"pi_stub_{req['id']}_11800"
+    # Fee flip: the hold charges the customer the subtotal only (10000),
+    # with the 18% fee recorded as the sitter-borne fee.
+    assert body["clientSecret"] == f"pi_stub_{req['id']}_10000"
     assert body["clientSecret"].startswith("pi_stub_")
-    assert body["amountCents"] == 11800
+    assert body["amountCents"] == 10000
     assert body["feeCents"] == 1800
     assert body["livemode"] is False
 
     rec = prepo.get_by_booking_id(req["id"])
     assert rec is not None
     assert rec["client_secret"] == body["clientSecret"]
-    assert rec["amount_cents"] == 11800
-    assert rec["fee_cents"] == 1800
+    assert rec["amount_cents"] == 10000   # customer total == subtotal
+    assert rec["fee_cents"] == 1800      # sitter-borne fee
     assert rec["status"] == "created"
     assert rec["created_at"]
+
+
+def test_sitting_intent_records_sitter_borne_fee(mem_payments):
+    # End-to-end fee semantics: customer_total == subtotal, sitter payout ==
+    # subtotal - fee, intent holds the customer total.
+    client, urepo, srepo, prepo = mem_payments
+    req = _setup_booking(client, urepo, srepo, price_cents=5000)
+    quote = payments_mod.quote_booking({"subtotal_cents": 5000})
+    assert quote["customer_total_cents"] == 5000
+    assert quote["sitter_payout_cents"] == 5000 - quote["fee_cents"]
+
+    body = client.post("/v1/payments/sitting-intent",
+                       json={"bookingId": req["id"]}, headers=ALICE).json()
+    assert body["amountCents"] == quote["customer_total_cents"]
+    assert body["feeCents"] == quote["fee_cents"]
+    rec = prepo.get_by_booking_id(req["id"])
+    assert rec["amount_cents"] == 5000
+    assert rec["fee_cents"] == quote["fee_cents"]
 
 
 def test_sitting_intent_idempotent_per_booking(mem_payments):
@@ -246,7 +292,7 @@ def test_sitting_intent_idempotent_per_booking(mem_payments):
     second = client.post("/v1/payments/sitting-intent",
                          json={"bookingId": req["id"]}, headers=ALICE).json()
     assert first == second
-    assert first["clientSecret"] == f"pi_stub_{req['id']}_5900"
+    assert first["clientSecret"] == f"pi_stub_{req['id']}_5000"
     assert len(prepo._intents) == 1
 
 
