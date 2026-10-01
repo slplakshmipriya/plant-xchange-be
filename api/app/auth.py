@@ -29,6 +29,7 @@ EXEMPT_PATHS = {
     # own auth (HMAC signature / shared secret) and are exempt here.
     "/v1/idv/webhook",
     "/v1/internal/sweep",
+    "/v1/internal/warm",
 }
 
 # Path prefixes that are public by design (listing photos served by the stub).

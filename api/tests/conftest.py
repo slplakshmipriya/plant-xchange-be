@@ -15,6 +15,17 @@ os.environ.setdefault("MESSAGE_ENCRYPTION_KEY", Fernet.generate_key().decode())
 os.environ.setdefault("GEO_ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 
+@pytest.fixture(autouse=True)
+def _clear_read_cache():
+    """The process-global LRU read cache (app.cache) must not leak entries
+    between tests — a stale entry from one test would poison the next."""
+    from app.cache import cache
+
+    cache.clear()
+    yield
+    cache.clear()
+
+
 @pytest.fixture()
 def client(monkeypatch) -> TestClient:
     """Fresh app instance per test; DATABASE_URL unset so migrations are skipped."""

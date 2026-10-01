@@ -33,6 +33,7 @@ import hashlib
 import hmac
 import math
 import os
+import time
 import random
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -42,6 +43,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .auth import ensure_owner, get_current_uid
+from .cache import CachedListingRepo
 from .config import get_settings
 from .crypto import GEO_KEY_ENV, decrypt_float, encrypt_float
 from .db import get_db_conn
@@ -604,7 +606,7 @@ class MemoryListingRepo:
 
 
 def get_listing_repo(conn=Depends(get_db_conn)) -> ListingRepo:
-    return PostgresListingRepo(conn)
+    return CachedListingRepo(PostgresListingRepo(conn))
 
 
 # ---------------------------------------------------------------- API models
@@ -1183,6 +1185,38 @@ def ripe_alert(
         if result["status"] in ("sent", "would_send"):
             notified += 1
     return {"listing_id": listing_id, "notified": notified, "date": today}
+
+
+@internal_router.get("/warm")
+def warm_ping(
+    request: Request,
+    conn=Depends(get_db_conn),
+) -> dict[str, Any]:
+    """Keep-warm ping for Cloud Scheduler: touches Neon so it doesn't suspend.
+
+    Auth: same shared secret as the sweep job (x-sweep-secret header), exempt
+    from Firebase auth via EXEMPT_PATHS. Runs SELECT 1 through the normal
+    pooled connection — the DB touch is what keeps Neon's compute from
+    idling into suspend, and the request itself keeps a Cloud Run instance
+    warm. The response carries the DB round-trip ms for scheduler-log
+    observability; a waking Neon shows up here as a large db_ms, not an
+    error (get_db_conn already retries through the wake).
+    """
+    secret = get_settings().sweep_secret
+    if not secret:
+        raise HTTPException(503, {"code": "sweep_not_configured",
+                                  "message": "SWEEP_SECRET is not configured"})
+    presented = request.headers.get("x-sweep-secret", "")
+    if not hmac.compare_digest(secret, presented):
+        raise HTTPException(401, {"code": "unauthorized",
+                                  "message": "Bad sweep secret"})
+
+    start = time.perf_counter()
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1")
+        cur.fetchone()
+    db_ms = (time.perf_counter() - start) * 1000
+    return {"status": "warm", "db_ms": round(db_ms, 1)}
 
 
 @internal_router.post("/sweep")

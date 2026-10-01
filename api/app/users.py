@@ -35,6 +35,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from .auth import ensure_owner, get_current_uid
+from .cache import CachedUserRepo
 from .config import get_settings
 from .credits import CreditRepo, ensure_starter_credits, get_credit_repo
 from .crypto import GEO_KEY_ENV, MESSAGE_KEY_ENV, decrypt_float, decrypt_text
@@ -244,7 +245,7 @@ class MemoryUserRepo:
 
 
 def get_user_repo(conn=Depends(get_db_conn)) -> UserRepo:
-    return PostgresUserRepo(conn)
+    return CachedUserRepo(PostgresUserRepo(conn))
 
 
 # --- Cross-domain repo dependencies (C6) -----------------------------------

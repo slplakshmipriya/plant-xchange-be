@@ -593,6 +593,38 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - bearerAuth: []
+  /v1/internal/warm:
+    get:
+      tags:
+      - internal
+      summary: Warm Ping
+      description: 'Keep-warm ping for Cloud Scheduler: touches Neon so it doesn''t
+        suspend.
+
+
+        Auth: same shared secret as the sweep job (x-sweep-secret header), exempt
+
+        from Firebase auth via EXEMPT_PATHS. Runs SELECT 1 through the normal
+
+        pooled connection — the DB touch is what keeps Neon''s compute from
+
+        idling into suspend, and the request itself keeps a Cloud Run instance
+
+        warm. The response carries the DB round-trip ms for scheduler-log
+
+        observability; a waking Neon shows up here as a large db_ms, not an
+
+        error (get_db_conn already retries through the wake).'
+      operationId: warm_ping_v1_internal_warm_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Warm Ping V1 Internal Warm Get
   /v1/internal/sweep:
     post:
       tags:

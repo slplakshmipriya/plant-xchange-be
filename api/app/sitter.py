@@ -22,6 +22,7 @@ from psycopg import errors as pg_errors
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .auth import get_current_uid
+from .cache import CachedSitterRepo
 from .db import get_db_conn
 from .users import UserRepo, get_user_repo
 
@@ -391,7 +392,7 @@ class MemorySitterRepo:
 
 
 def get_sitter_repo(conn=Depends(get_db_conn)) -> SitterRepo:
-    return PostgresSitterRepo(conn)
+    return CachedSitterRepo(PostgresSitterRepo(conn))
 
 
 class SitterProfileIn(BaseModel):

@@ -48,6 +48,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from .auth import get_current_uid
+from .cache import CachedMessageRepo
 from .crypto import MESSAGE_KEY_ENV, decrypt_text, encrypt_text
 from .db import get_db_conn
 from .listings import ListingRepo, get_listing_repo
@@ -286,7 +287,7 @@ class MemoryMessageRepo:
 
 
 def get_message_repo(conn=Depends(get_db_conn)) -> MessageRepo:
-    return PostgresMessageRepo(conn)
+    return CachedMessageRepo(PostgresMessageRepo(conn))
 
 
 class ThreadIn(BaseModel):
