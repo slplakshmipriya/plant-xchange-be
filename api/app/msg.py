@@ -61,10 +61,18 @@ from .moderation import (
     require_support,
 )
 from .storage import (
+    GCSBlobStore,
+    GCSStorage,
     StorageError,
     StorageNotConfigured,
     _check_key_format,
     get_storage,
+)
+from .images import (
+    StoredImagesRepo,
+    get_blob_store_or_none,
+    get_images_repo,
+    release_listing_images,
 )
 from .uploads import UploadsRegistry, get_uploads_registry
 from .users import UserRepo, get_user_repo
@@ -105,6 +113,8 @@ class MessageRepo(Protocol):
     def list_threads_for(self, uid: str, owner_listing_ids: list[str]) -> list[dict[str, Any]]: ...
     def add_message(self, thread_id: str, sender_uid: str, body: str,
                     kind: str = "text", photo_url: str | None = None) -> dict[str, Any]: ...
+    def get_message(self, message_id: str) -> dict[str, Any] | None: ...
+    def soft_delete_message(self, message_id: str) -> dict[str, Any] | None: ...
     def list_messages(self, thread_id: str, offset: int, limit: int) -> list[dict[str, Any]]: ...
     def count_messages(self, thread_id: str) -> int: ...
     # M10a: batched counts so list_threads doesn't issue one COUNT per thread.
@@ -128,9 +138,28 @@ def _serialize_thread(row: dict[str, Any], message_count: int = 0,
     }
 
 
-def _serialize_message(row: dict[str, Any]) -> dict[str, Any]:
+def _serialize_message(row: dict[str, Any],
+                       reveal_deleted: bool = False) -> dict[str, Any]:
     """Public message shape. The single read boundary: ``body`` is decrypted
-    here (fail closed — tampered token or missing key raises)."""
+    here (fail closed — tampered token or missing key raises).
+
+    Soft-deleted messages serialize as tombstones: content hidden from
+    participants, but the slot (and pagination offsets) stay stable.
+    ``reveal_deleted`` is for the audit-logged support path only — deleted
+    content stays reviewable for reported-then-deleted messages.
+    """
+    if row.get("deleted_at") and not reveal_deleted:
+        return {
+            "id": str(row["id"]),
+            "thread_id": str(row["thread_id"]),
+            "sender_uid": row["sender_uid"],
+            "kind": row.get("kind", "text"),
+            "deleted": True,
+            "deleted_at": row.get("deleted_at"),
+            "body": None,
+            "photo_url": None,
+            "created_at": row.get("created_at"),
+        }
     body = row.get("body")
     if not isinstance(body, str):
         # M24b: fail closed with the uniform RuntimeError envelope, not an
@@ -141,6 +170,7 @@ def _serialize_message(row: dict[str, Any]) -> dict[str, Any]:
         "thread_id": str(row["thread_id"]),
         "sender_uid": row["sender_uid"],
         "kind": row.get("kind", "text"),
+        "deleted": bool(row.get("deleted_at")),
         "body": decrypt_text(body, MESSAGE_KEY_ENV),
         "photo_url": row.get("photo_url"),
         "created_at": row.get("created_at"),
@@ -216,6 +246,19 @@ class PostgresMessageRepo:
             (thread_id, limit + 1, offset)).fetchall()
         return [self._row(r) for r in rows]
 
+    def get_message(self, message_id):
+        row = self._conn.execute(
+            "SELECT * FROM messages WHERE id = %s", (message_id,)).fetchone()
+        return self._row(row) if row else None
+
+    def soft_delete_message(self, message_id):
+        row = self._conn.execute(
+            "UPDATE messages SET deleted_at = now() "
+            "WHERE id = %s AND deleted_at IS NULL RETURNING *",
+            (message_id,)).fetchone()
+        self._conn.commit()
+        return self._row(row) if row else None
+
     def count_messages(self, thread_id):
         row = self._conn.execute(
             "SELECT COUNT(*) AS n FROM messages WHERE thread_id = %s",
@@ -277,6 +320,22 @@ class MemoryMessageRepo:
         msgs = sorted(self._messages.get(thread_id, []),
                       key=lambda m: (m["created_at"], m["id"]))
         return [dict(m) for m in msgs[offset:offset + limit + 1]]
+
+    def get_message(self, message_id):
+        for msgs in self._messages.values():
+            for m in msgs:
+                if m["id"] == message_id:
+                    return dict(m)
+        return None
+
+    def soft_delete_message(self, message_id):
+        from .listings import utcnow
+        for msgs in self._messages.values():
+            for m in msgs:
+                if m["id"] == message_id and not m.get("deleted_at"):
+                    m["deleted_at"] = utcnow().isoformat()
+                    return dict(m)
+        return None
 
     def count_messages(self, thread_id):
         return len(self._messages.get(thread_id, []))
@@ -475,6 +534,49 @@ def attach_photo(
         repo.add_message(thread_id, uid, public_url, kind="photo", photo_url=public_url))
 
 
+@router.delete("/threads/{thread_id}/messages/{message_id}", tags=["messaging"])
+def delete_message(
+    thread_id: str,
+    message_id: str,
+    uid: str = Depends(get_current_uid),
+    repo: MessageRepo = Depends(get_message_repo),
+    listing_repo: ListingRepo = Depends(get_listing_repo),
+    images_repo: StoredImagesRepo = Depends(get_images_repo),
+    blob_store: GCSBlobStore | None = Depends(get_blob_store_or_none),
+) -> dict[str, Any]:
+    """Delete your own message. Sender only — participants cannot delete each
+    other's messages.
+
+    Soft delete: the message becomes a tombstone (``deleted: true``, content
+    hidden) so pagination offsets stay stable for both participants. Photo
+    messages release their refcounted GCS object; shared dedupe objects
+    survive until their last reference is released. Idempotent: deleting an
+    already-deleted message returns its tombstone.
+    """
+    thread = repo.get_thread(thread_id)
+    listing = listing_repo.get(thread["listing_id"]) if thread else None
+    _participant_or_403(thread, listing, uid)
+    msg = repo.get_message(message_id)
+    if msg is None or str(msg["thread_id"]) != thread_id:
+        raise HTTPException(404, {"code": "message_not_found",
+                                  "message": "No such message in this thread"})
+    if msg["sender_uid"] != uid:
+        raise HTTPException(403, {"code": "not_your_message",
+                                  "message": "Only the sender can delete a message"})
+    if msg.get("deleted_at"):
+        return _serialize_message(msg)
+    deleted = repo.soft_delete_message(message_id)
+    if msg.get("kind") == "photo" and msg.get("photo_url"):
+        backend = get_storage()
+        bucket = backend.bucket if isinstance(backend, GCSStorage) else None
+        # Refcounted release: no-op on the local stub; on GCS the object is
+        # deleted only when its refcount hits 0 (shared dedupe objects
+        # survive for their other referrers).
+        release_listing_images([msg["photo_url"]], images_repo=images_repo,
+                               blob_store=blob_store, bucket=bucket)
+    return _serialize_message(deleted)
+
+
 @router.get("/threads/{thread_id}/messages", tags=["messaging"])
 def read_messages(
     thread_id: str,
@@ -553,6 +655,6 @@ def support_read_messages(
     ])
     return {
         "thread_id": thread_id,
-        "messages": [_serialize_message(m) for m in page],  # decrypts; fail closed
+        "messages": [_serialize_message(m, reveal_deleted=True) for m in page],  # decrypts; fail closed
         "next_cursor": _encode_cursor(offset + limit) if has_more else None,
     }

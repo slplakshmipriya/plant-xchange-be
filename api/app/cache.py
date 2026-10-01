@@ -394,6 +394,12 @@ class CachedMessageRepo:
         cache.invalidate_prefix(f"m:{thread_id}:")
         return row
 
+    def soft_delete_message(self, message_id: str) -> dict[str, Any] | None:
+        row = self._inner.soft_delete_message(message_id)
+        if row is not None:
+            cache.invalidate_prefix(f"m:{row['thread_id']}:")
+        return row
+
     def __getattr__(self, name: str) -> Any:
         # Thread management (get_or_create_thread, etc.) is low-frequency ->
         # delegate without caching rather than enumerating every method.

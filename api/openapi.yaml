@@ -2018,6 +2018,59 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - bearerAuth: []
+  /v1/threads/{thread_id}/messages/{message_id}:
+    delete:
+      tags:
+      - messaging
+      - messaging
+      summary: Delete Message
+      description: 'Delete your own message. Sender only — participants cannot delete
+        each
+
+        other''s messages.
+
+
+        Soft delete: the message becomes a tombstone (``deleted: true``, content
+
+        hidden) so pagination offsets stay stable for both participants. Photo
+
+        messages release their refcounted GCS object; shared dedupe objects
+
+        survive until their last reference is released. Idempotent: deleting an
+
+        already-deleted message returns its tombstone.'
+      operationId: delete_message_v1_threads__thread_id__messages__message_id__delete
+      parameters:
+      - name: thread_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Thread Id
+      - name: message_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Message Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Delete Message V1 Threads  Thread Id  Messages  Message
+                  Id  Delete
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - bearerAuth: []
   /v1/support/threads/{thread_id}/messages:
     get:
       tags:

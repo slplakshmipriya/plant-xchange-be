@@ -485,3 +485,90 @@ def test_release_noops_off_gcs():
         blob_store=None, bucket="b") == 0
     assert release_listing_images(None, images_repo=MemoryStoredImagesRepo(),
                                   blob_store=FakeBlobStore(), bucket="b") == 0
+
+
+# --- message delete: refcounted photo release -----------------------------
+
+def _finalize_as(ns, raw: bytes, headers: dict, content_type: str = "image/png") -> dict:
+    """sign -> fake client PUT -> finalize, as the given user."""
+    r = ns.client.post("/v1/uploads/sign",
+                       json={"content_type": content_type, "size_bytes": len(raw)},
+                       headers=headers)
+    assert r.status_code == 200, r.text
+    key = r.json()["key"]
+    ns.fake.upload(key, raw, content_type)
+    fin = ns.client.post("/v1/uploads/finalize", json={"key": key}, headers=headers)
+    assert fin.status_code == 200, fin.text
+    return fin.json()
+
+
+def _thread_on_listing(ns, listing_payload: dict) -> str:
+    """Alice owns a listing; bob opens a thread on it. Returns the thread id."""
+    from app import listings as listings_mod
+    from app import msg as msg_mod
+
+    mrepo = msg_mod.MemoryMessageRepo()
+    ns.client.app.dependency_overrides[msg_mod.get_message_repo] = lambda: mrepo
+    ns.client.app.dependency_overrides[msg_mod.get_listing_repo] = lambda: ns.listings
+    ns.users.upsert("alice", display_name="Alice")
+    ns.users.upsert("bob", display_name="Bob")
+
+    r = ns.client.post("/v1/listings", json=listing_payload, headers=HEADERS)
+    assert r.status_code == 201, r.text
+    lid = r.json()["id"]
+    r = ns.client.post("/v1/threads", json={"listing_id": lid}, headers=BOB_HEADERS)
+    assert r.status_code == 201, r.text
+    return lid, r.json()["id"]
+
+
+def _attach(ns, tid: str, headers: dict, key: str) -> dict:
+    r = ns.client.post(f"/v1/threads/{tid}/attachments",
+                       json={"uploadKey": key}, headers=headers)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_delete_photo_message_releases_unshared_gcs_object(gcs_client):
+    ns = gcs_client
+    lid, tid = _thread_on_listing(ns, _harvest_payload(["https://example.com/cover.jpg"]))
+
+    meta = _finalize_as(ns, _png(31), BOB_HEADERS)   # bob's own photo, refcount 1
+    key = meta["public_url"].split("test-bucket/")[1]
+    msg = _attach(ns, tid, BOB_HEADERS, meta["key"])
+    assert msg["kind"] == "photo"
+
+    r = ns.client.delete(f"/v1/threads/{tid}/messages/{msg['id']}", headers=BOB_HEADERS)
+    assert r.status_code == 200, r.text
+    tomb = r.json()
+    assert tomb["deleted"] is True and tomb["photo_url"] is None
+
+    # Last reference released: object + row are gone.
+    assert key in ns.fake.deleted
+    assert key not in ns.fake.objects
+    assert ns.images.get_by_gcs_key(key) is None
+
+
+def test_delete_photo_message_keeps_shared_gcs_object(gcs_client):
+    ns = gcs_client
+    shared = _finalize_as(ns, _png(32), HEADERS)     # alice, refcount 1
+    lid, tid = _thread_on_listing(ns, _harvest_payload([shared["public_url"]]))
+
+    # Bob uploads the same bytes in chat -> dedupe survivor, refcount 2.
+    dup = _finalize_as(ns, _png(32), BOB_HEADERS)
+    assert dup["key"] == shared["key"]
+    key = shared["public_url"].split("test-bucket/")[1]
+    msg = _attach(ns, tid, BOB_HEADERS, dup["key"])
+
+    r = ns.client.delete(f"/v1/threads/{tid}/messages/{msg['id']}", headers=BOB_HEADERS)
+    assert r.status_code == 200, r.text
+
+    # Alice's listing still references it: refcount 2 -> 1, object survives.
+    assert key not in ns.fake.deleted
+    assert key in ns.fake.objects
+    assert ns.images.get_by_gcs_key(key)["refcount"] == 1
+
+    # Cancelling alice's listing releases the last reference -> object deleted.
+    cancelled = ns.client.post(f"/v1/listings/{lid}/cancel", headers=HEADERS)
+    assert cancelled.status_code == 200, cancelled.text
+    assert key in ns.fake.deleted
+    assert key not in ns.fake.objects

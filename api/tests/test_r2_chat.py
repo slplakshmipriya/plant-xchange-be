@@ -310,3 +310,81 @@ def test_text_message_kind_defaults_to_text(chat_client):
     assert r.status_code == 201, r.text
     assert r.json()["kind"] == "text"
     assert r.json()["photo_url"] is None
+
+
+# --- message delete --------------------------------------------------------
+
+def _send(chat_client, tid, headers, body="hello"):
+    r = chat_client.post(f"/v1/threads/{tid}/messages",
+                         json={"body": body}, headers=headers)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_delete_own_message_returns_tombstone(chat_client):
+    tid = _thread_id(chat_client, _listing_id(chat_client))
+    m1 = _send(chat_client, tid, BOB, "first")
+    m2 = _send(chat_client, tid, BOB, "second")
+    r = chat_client.delete(f"/v1/threads/{tid}/messages/{m1['id']}", headers=BOB)
+    assert r.status_code == 200, r.text
+    tomb = r.json()
+    assert tomb["id"] == m1["id"]
+    assert tomb["deleted"] is True
+    assert tomb["body"] is None
+    assert tomb["photo_url"] is None
+    # The tombstone keeps its slot — pagination offsets stay stable.
+    r = chat_client.get(f"/v1/threads/{tid}/messages", headers=BOB)
+    assert r.status_code == 200, r.text
+    msgs = r.json()["messages"]
+    assert [m["id"] for m in msgs] == [m1["id"], m2["id"]]
+    assert msgs[0]["deleted"] is True
+    assert msgs[0]["body"] is None
+    assert msgs[0]["photo_url"] is None
+    assert msgs[1]["deleted"] is False
+    assert msgs[1]["body"] == "second"
+
+
+def test_delete_message_idempotent(chat_client):
+    tid = _thread_id(chat_client, _listing_id(chat_client))
+    m = _send(chat_client, tid, BOB)
+    url = f"/v1/threads/{tid}/messages/{m['id']}"
+    r1 = chat_client.delete(url, headers=BOB)
+    r2 = chat_client.delete(url, headers=BOB)
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.json() == r2.json()
+    assert r2.json()["deleted"] is True
+
+
+def test_delete_other_participants_message_forbidden(chat_client):
+    tid = _thread_id(chat_client, _listing_id(chat_client))
+    m = _send(chat_client, tid, BOB)
+    r = chat_client.delete(f"/v1/threads/{tid}/messages/{m['id']}", headers=ALICE)
+    assert r.status_code == 403, r.text
+    assert r.json()["code"] == "not_your_message"
+    # The message is untouched.
+    r = chat_client.get(f"/v1/threads/{tid}/messages", headers=ALICE)
+    assert r.json()["messages"][0]["deleted"] is False
+
+
+def test_delete_message_nonparticipant_forbidden(chat_client):
+    tid = _thread_id(chat_client, _listing_id(chat_client))
+    m = _send(chat_client, tid, BOB)
+    r = chat_client.delete(f"/v1/threads/{tid}/messages/{m['id']}", headers=MALLORY)
+    assert r.status_code == 403, r.text
+
+
+def test_delete_message_not_found(chat_client):
+    lid = _listing_id(chat_client)
+    tid = _thread_id(chat_client, lid)
+    m = _send(chat_client, tid, BOB)
+    # Unknown message id.
+    r = chat_client.delete(f"/v1/threads/{tid}/messages/00000000-0000-0000-0000-000000000000",
+                           headers=BOB)
+    assert r.status_code == 404, r.text
+    assert r.json()["code"] == "message_not_found"
+    # Message from a different thread: not addressable through this thread.
+    lid2 = _listing_id(chat_client)  # second listing for a second thread
+    tid2 = _thread_id(chat_client, lid2)
+    r = chat_client.delete(f"/v1/threads/{tid2}/messages/{m['id']}", headers=BOB)
+    assert r.status_code == 404, r.text
+    assert r.json()["code"] == "message_not_found"
