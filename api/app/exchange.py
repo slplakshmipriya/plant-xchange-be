@@ -27,7 +27,15 @@ from pydantic import BaseModel, Field
 
 from .auth import get_current_uid
 from .claims import ClaimRepo, _enforce_claim_eligibility, get_claim_repo, serialize_spend
+from .config import get_settings
 from .credits import CreditRepo, get_credit_repo
+from .images import (
+    GCSBlobStore,
+    StoredImagesRepo,
+    get_blob_store_or_none,
+    get_images_repo,
+    release_listing_images,
+)
 from .listings import ListingRepo, can_transition, get_listing_repo, public_listing
 from .moderation import ModerationRepo, get_moderation_repo
 from .users import UserRepo, get_user_repo
@@ -134,6 +142,8 @@ def confirm_exchange(
     uid: str = Depends(get_current_uid),
     repo: ListingRepo = Depends(get_listing_repo),
     credit_repo: CreditRepo = Depends(get_credit_repo),
+    images_repo: StoredImagesRepo = Depends(get_images_repo),
+    blob_store: GCSBlobStore | None = Depends(get_blob_store_or_none),
 ) -> dict[str, Any]:
     """Both parties confirm; credits move exactly once when both are in."""
     if data.idempotency_key:
@@ -192,6 +202,7 @@ def confirm_exchange(
             # key resumes here instead of short-circuiting (see the top of this
             # function) — a mid-flight crash is recoverable by retry: re-adds
             # are no-ops, then the flip completes.
+            completed = None
             with _atomic(repo, credit_repo):
                 credit_repo.add_entry(row["claimer_uid"], -cost, "exchange_spend",
                                       ref_id=data.listing_id,
@@ -202,6 +213,17 @@ def confirm_exchange(
                 completed = repo.complete_if_claimed(data.listing_id)
                 if completed is not None:
                     row = completed
+            if completed is not None:
+                # The swap is done: its photos no longer back an active
+                # listing. Refcounted release — objects shared via dedupe
+                # survive until the last referencing listing is released.
+                # No-op unless STORAGE_BACKEND=gcs.
+                release_listing_images(
+                    completed.get("photos"),
+                    images_repo=images_repo,
+                    blob_store=blob_store,
+                    bucket=get_settings().gcs_bucket,
+                )
     return {
         "status": row["status"],
         "confirmed_by": sorted(confirmed),

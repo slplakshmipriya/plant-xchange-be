@@ -35,9 +35,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from .auth import ensure_owner, get_current_uid
+from .config import get_settings
 from .credits import CreditRepo, ensure_starter_credits, get_credit_repo
 from .crypto import GEO_KEY_ENV, MESSAGE_KEY_ENV, decrypt_float, decrypt_text
 from .db import get_db_conn
+from .images import release_listing_images
 router = APIRouter(prefix="/v1/users", tags=["users"])
 
 ZIP_RE = re.compile(r"^\d{5}$")
@@ -282,6 +284,21 @@ def _message_repo(conn=Depends(get_db_conn)):
     return get_message_repo(conn=conn)
 
 
+def _images_repo(conn=Depends(get_db_conn)):
+    from .images import get_images_repo
+
+    return get_images_repo(conn=conn)
+
+
+def _blob_store():
+    # No Depends(get_db_conn): the blob store is not a database repo.
+    # Returns None (not an error) off the GCS backend so delete_me stays a
+    # pure local no-op there.
+    from .images import get_blob_store_or_none
+
+    return get_blob_store_or_none()
+
+
 # Max messages pulled per thread per page when assembling the export.
 _EXPORT_MESSAGE_PAGE = 500
 
@@ -503,6 +520,8 @@ def delete_me(
     repo: UserRepo = Depends(get_user_repo),
     notification_repo: Any = Depends(_notification_repo),
     listing_repo: Any = Depends(_listing_repo),
+    images_repo: Any = Depends(_images_repo),
+    blob_store: Any = Depends(_blob_store),
 ) -> None:
     """Delete the caller's account and all of their data (C6).
 
@@ -511,8 +530,18 @@ def delete_me(
     if a retention/grace window becomes a compliance requirement.
     Dependent rows cascade in Postgres via ON DELETE CASCADE (migration
     0024 adds the two FKs that were missing); the in-memory repos used in
-    tests mirror that cascade. Idempotent: deleting twice still returns 204.
+    tests mirror that cascade. The user's listings' photos are
+    refcount-released from GCS *before* the cascade (after the rows are gone
+    there is nothing left to read the photo URLs from). Idempotent: deleting
+    twice still returns 204.
     """
+    for listing in listing_repo.list_by_owner(uid):
+        release_listing_images(
+            listing.get("photos"),
+            images_repo=images_repo,
+            blob_store=blob_store,
+            bucket=get_settings().gcs_bucket,
+        )
     repo.delete(uid)
     _mirror_memory_cascade(uid, notification_repo, listing_repo)
     return None

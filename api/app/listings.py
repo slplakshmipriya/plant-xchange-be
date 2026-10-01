@@ -36,7 +36,7 @@ import os
 import random
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -45,6 +45,13 @@ from .auth import ensure_owner, get_current_uid
 from .config import get_settings
 from .crypto import GEO_KEY_ENV, decrypt_float, encrypt_float
 from .db import get_db_conn
+from .images import (
+    GCSBlobStore,
+    StoredImagesRepo,
+    get_blob_store_or_none,
+    get_images_repo,
+    release_listing_images,
+)
 from .notify import (
     NotificationRepo,
     get_notification_repo,
@@ -694,6 +701,12 @@ def _upload_key_from_url(url: Any) -> str | None:
     return key or None
 
 
+#: Callable the retention sweep uses to refcount-release GCS objects for
+#: swept photo URLs. Takes the listing's photo URLs; returns GCS objects
+#: deleted. ``None`` (or a no-op) on non-GCS backends.
+GCSReleaser = Callable[[list[str]], int]
+
+
 class RetentionRepo(Protocol):
     def purge_notification_log(self, older_than_days: int) -> int:
         """Delete notification_log rows older than the window. Returns count."""
@@ -701,11 +714,18 @@ class RetentionRepo(Protocol):
     def purge_resolved_disputes(self, older_than_days: int) -> int:
         """Delete resolved disputes older than the window. Returns count."""
         ...
-    def gc_terminal_listing_media(self, older_than_days: int) -> int:
+    def gc_terminal_listing_media(
+        self,
+        older_than_days: int,
+        gcs_releaser: GCSReleaser | None = None,
+    ) -> int:
         """Media GC for terminal listings (M19). For listings in a terminal
         state (completed/expired/cancelled) older than the window, delete the
         matching ``uploads`` registry rows and clear the listing's photos.
-        Returns the number of registry rows deleted."""
+        ``gcs_releaser`` (optional) is called with the swept photo URLs so the
+        GCS backend can refcount-release the stored images; it is a backstop
+        for rows not already released at completion time. Returns the number
+        of registry rows deleted."""
         ...
 
 
@@ -730,7 +750,11 @@ class PostgresRetentionRepo:
         self._conn.commit()
         return cur.rowcount or 0
 
-    def gc_terminal_listing_media(self, older_than_days: int) -> int:
+    def gc_terminal_listing_media(
+        self,
+        older_than_days: int,
+        gcs_releaser: GCSReleaser | None = None,
+    ) -> int:
         rows = self._conn.execute(
             "SELECT id, photos FROM listings "
             "WHERE status IN ('completed','expired','cancelled') "
@@ -740,9 +764,11 @@ class PostgresRetentionRepo:
         ).fetchall()
         keys: set[str] = set()
         ids: list[Any] = []
+        swept_urls: list[str] = []
         for r in rows:
             ids.append(r["id"])
             for url in r["photos"] or []:
+                swept_urls.append(url)
                 key = _upload_key_from_url(url)
                 if key:
                     keys.add(key)
@@ -750,8 +776,8 @@ class PostgresRetentionRepo:
         if keys:
             # After the C7 fix, serve_public 404s without a finalized registry
             # row — deleting the row stops the bytes being served. Physical
-            # byte deletion needs a storage-layer delete API (storage.py has
-            # none yet) and is a documented follow-up.
+            # GCS byte deletion happens via gcs_releaser below (refcounted);
+            # local-stub bytes are dev-only and left to the OS.
             cur = self._conn.execute(
                 "DELETE FROM uploads WHERE key = ANY(%s)", (list(keys),))
             deleted = cur.rowcount or 0
@@ -759,6 +785,10 @@ class PostgresRetentionRepo:
             self._conn.execute(
                 "UPDATE listings SET photos = '{}' WHERE id = ANY(%s)", (ids,))
         self._conn.commit()
+        if gcs_releaser is not None and swept_urls:
+            # Backstop: normally already released at completion time; this
+            # catches rows from before the release hooks existed.
+            gcs_releaser(swept_urls)
         return deleted
 
 
@@ -805,9 +835,14 @@ class MemoryRetentionRepo:
         self._disputes[:] = keep
         return purged
 
-    def gc_terminal_listing_media(self, older_than_days: int) -> int:
+    def gc_terminal_listing_media(
+        self,
+        older_than_days: int,
+        gcs_releaser: GCSReleaser | None = None,
+    ) -> int:
         cutoff = utcnow() - timedelta(days=older_than_days)
         deleted = 0
+        swept_urls: list[str] = []
         for row in self._listings.values():
             if row.get("status") not in ("completed", "expired", "cancelled"):
                 continue
@@ -815,10 +850,13 @@ class MemoryRetentionRepo:
             if created is None or created >= cutoff:
                 continue
             for url in row.get("photos") or []:
+                swept_urls.append(url)
                 key = _upload_key_from_url(url)
                 if key and self._uploads.pop(key, None) is not None:
                     deleted += 1
             row["photos"] = []
+        if gcs_releaser is not None and swept_urls:
+            gcs_releaser(swept_urls)
         return deleted
 
 
@@ -992,6 +1030,8 @@ def record_harvest_event(
     data: HarvestEventIn,
     uid: str = Depends(get_current_uid),
     repo: ListingRepo = Depends(get_listing_repo),
+    images_repo: StoredImagesRepo = Depends(get_images_repo),
+    blob_store: GCSBlobStore | None = Depends(get_blob_store_or_none),
 ) -> dict[str, Any]:
     """Record kilos picked from a harvest listing (owner only, live only).
 
@@ -1024,6 +1064,15 @@ def record_harvest_event(
         remaining = 0.0
         flipped = repo.complete_if_live(data.listing_id)
         updated = flipped if flipped is not None else repo.get(data.listing_id)
+        if flipped is not None:
+            # The harvest is done: its photos no longer back an active
+            # listing. Refcounted release (no-op unless STORAGE_BACKEND=gcs).
+            release_listing_images(
+                flipped.get("photos"),
+                images_repo=images_repo,
+                blob_store=blob_store,
+                bucket=get_settings().gcs_bucket,
+            )
     return {
         "listing": public_listing(updated, viewer_uid=uid),
         "delta_kg": data.delta_kg,
@@ -1131,6 +1180,8 @@ def sweep_expired(
     repo: ListingRepo = Depends(get_listing_repo),
     notify_repo: NotificationRepo = Depends(get_notification_repo),
     retention_repo: RetentionRepo = Depends(get_retention_repo),
+    images_repo: StoredImagesRepo = Depends(get_images_repo),
+    blob_store: GCSBlobStore | None = Depends(get_blob_store_or_none),
 ) -> dict[str, Any]:
     """Idempotent expiry job. Auth: shared secret header (NOT a user token).
 
@@ -1143,7 +1194,9 @@ def sweep_expired(
     purged, resolved disputes older than 2y are purged, and photos of
     terminal listings (completed/expired/cancelled) older than 180d are
     garbage-collected from the uploads registry (unserved after the C7
-    registry gate) with the listing's photo list cleared. The credit ledger,
+    registry gate) with the listing's photo list cleared; on the GCS backend
+    the stored images are additionally refcount-released (deleted only when
+    the last referencing listing is gone). The credit ledger,
     harvest_events, moderation_views, and reports/strikes/enforcement are
     append-only by design and never purged (see module docstring).
     """
@@ -1154,6 +1207,18 @@ def sweep_expired(
     presented = request.headers.get("x-sweep-secret", "")
     if not hmac.compare_digest(secret, presented):
         raise HTTPException(401, {"code": "unauthorized", "message": "Bad sweep secret"})
+
+    def _release_swept(urls: list[str]) -> int:
+        # Backstop for stored_images rows not already released at completion
+        # time (e.g. completed before the release hooks existed). No-op off
+        # GCS — blob_store is not None here by construction.
+        return release_listing_images(
+            urls,
+            images_repo=images_repo,
+            blob_store=blob_store,
+            bucket=get_settings().gcs_bucket,
+        )
+
     now = utcnow()
     n = repo.sweep_expired(now)
     nudged = {48: 0, 12: 0}
@@ -1175,7 +1240,8 @@ def sweep_expired(
         "resolved_disputes_purged": retention_repo.purge_resolved_disputes(
             RESOLVED_DISPUTE_RETENTION_DAYS),
         "terminal_media_gc": retention_repo.gc_terminal_listing_media(
-            TERMINAL_LISTING_MEDIA_GC_DAYS),
+            TERMINAL_LISTING_MEDIA_GC_DAYS,
+            gcs_releaser=_release_swept if blob_store is not None else None),
     }
     return {"expired": n, "nudged_48h": nudged[48], "nudged_12h": nudged[12],
             "retention": retention}

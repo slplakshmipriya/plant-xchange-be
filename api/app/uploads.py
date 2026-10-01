@@ -8,8 +8,17 @@ from pydantic import BaseModel, Field
 
 from .auth import get_current_uid
 from .db import get_db_conn
+from .images import (
+    GCSBlobStore,
+    QuotaExceeded,
+    StoredImagesRepo,
+    finalize_gcs_upload,
+    get_blob_store_or_none,
+    get_images_repo,
+)
 from .storage import (
     MAX_IMAGE_BYTES,
+    GCSStorage,
     PostgresUploadsRegistry,
     StorageError,
     StorageNotConfigured,
@@ -17,6 +26,7 @@ from .storage import (
     get_storage,
     guess_media_type,
 )
+from .users import UserRepo, get_user_repo
 
 router = APIRouter(prefix="/v1/uploads", tags=["uploads"])
 
@@ -86,9 +96,35 @@ def finalize_upload(
     data: FinalizeIn,
     uid: str = Depends(get_current_uid),
     registry: UploadsRegistry = Depends(get_uploads_registry),
+    images_repo: StoredImagesRepo = Depends(get_images_repo),
+    user_repo: UserRepo = Depends(get_user_repo),
+    blob_store: GCSBlobStore | None = Depends(get_blob_store_or_none),
 ) -> dict:
+    backend = get_storage()
+    if isinstance(backend, GCSStorage):
+        if blob_store is None or not backend.bucket:
+            raise HTTPException(501, {"code": "storage_not_configured",
+                                      "message": "GCS blob store is not configured"})
+        # zipcode is informational only: the listing does not exist yet at
+        # upload time, so we record the uploader's home_zip (may be None).
+        profile = user_repo.get(uid)
+        zipcode = profile.get("home_zip") if profile else None
+        try:
+            meta = finalize_gcs_upload(blob_store, backend.bucket, uid, data.key,
+                                       images_repo, zipcode)
+        except QuotaExceeded as exc:
+            raise HTTPException(413, {"code": "bucket_quota_exceeded",
+                                      "message": str(exc)})
+        except StorageError as exc:
+            raise _storage_error(exc)
+        # GCS keys never pass through PUT /raw (501): create the registry row
+        # here so finalize-gated serving and the retention sweep keep working.
+        registry.record_raw(meta["key"], uid)
+        registry.mark_finalized(meta["key"])
+        return meta
+    # Local-stub backend: the original in-process pipeline.
     try:
-        meta = get_storage().finalize(uid, data.key)
+        meta = backend.finalize(uid, data.key)
     except StorageError as exc:
         raise _storage_error(exc)
     # Only after EXIF stripping succeeded: the file is safe to serve publicly.

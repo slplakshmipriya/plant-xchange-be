@@ -5,26 +5,30 @@ Flow: ``POST /v1/uploads/sign`` -> client PUTs bytes to ``upload_url`` ->
 listing ``photos[]`` entries reference.
 
 - ``StorageBackend`` is the abstraction; ``LocalStubStorage`` (default) keeps
-  files under ``./var/uploads`` for dev/test, ``GCSStorage`` is a skeleton
-  selected by ``STORAGE_BACKEND=gcs`` (structure only — no creds here).
+  files under ``./var/uploads`` for dev/test, ``GCSStorage`` is the
+  production backend selected by ``STORAGE_BACKEND=gcs`` (needs the
+  ``google-cloud-storage`` package + ``GCS_BUCKET`` + ADC credentials).
 - Server-side validation on finalize: content is a real image (Pillow),
   size <= 8 MB, and **EXIF GPS is stripped** (privacy: phone photos embed
   exact coordinates — SEC-010).
 - Keys are ``u/{uid}/{uuid}.{ext}``; ownership and path traversal are
   enforced on every operation.
+- GCS finalize additionally dedupes by perceptual hash and enforces the
+  ``GCS_MAX_BYTES`` bucket quota — see ``app/images.py``.
 
 Pre-launch storage checklist (H5):
   1. ``STORAGE_BACKEND=gcs`` and ``GCS_BUCKET`` are set; the
      ``google-cloud-storage`` package is installed; the runtime service
-     account can ``storage.objects.get/create`` on the bucket.
+     account can ``storage.objects.get/create/delete`` on the bucket
+     (delete is needed for dedupe temp-cleanup and refcount-zero removal).
   2. ``ENVIRONMENT=production`` (or ``prod``) — the app refuses to boot with
      ``STORAGE_BACKEND=local`` in prod (``validate_storage_config``); local
      dev keeps the local stub default.
-  3. ``GCSStorage.finalize`` downloads -> validates -> strips GPS EXIF ->
-     re-uploads. Before launch, verify on one real photo: download the
-     public object and confirm the GPS IFD is gone.
-  4. ``GCSStorage.sign_upload`` is still a skeleton (V4 signed-PUT minting
-     not wired) — do NOT go live on the GCS backend until it is.
+  3. Listing photos are served as public
+     ``https://storage.googleapis.com/{bucket}/{key}`` URLs — the bucket
+     needs public-read (or a CDN in front) for photos to load.
+  4. ``GCS_MAX_BYTES`` caps total stored bytes (default 5 GiB = Firebase
+     Spark free-tier max); finalize rejects over-quota uploads with 413.
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ from .config import Settings, get_settings
 logger = logging.getLogger(__name__)
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+SIGN_URL_TTL_SECONDS = 15 * 60  # signed PUT URLs expire after 15 minutes
 KEY_RE = re.compile(r"^u/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+\.[a-z0-9]+$")
 GPS_IFD_TAG = 0x8825  # EXIF GPSInfo IFD
 
@@ -202,6 +207,17 @@ class GCSBlobStore(Protocol):
         """Replace the blob at ``key`` with ``data``."""
         ...
 
+    def delete(self, key: str) -> None:
+        """Delete the blob at ``key``. Missing keys are a no-op."""
+        ...
+
+    def sign_put_url(self, key: str, content_type: str, expires_seconds: int) -> str:
+        """Mint a signed URL the client PUTs raw bytes to.
+
+        ``content_type`` is advisory only — the URL does not constrain the
+        PUT's Content-Type header, so existing clients need no change.
+        """
+
 
 class _LiveGCSBlobStore:
     """Real GCS I/O. Built lazily so importing this module never needs the
@@ -214,7 +230,14 @@ class _LiveGCSBlobStore:
             raise StorageNotConfigured(
                 "STORAGE_BACKEND=gcs requires the google-cloud-storage package"
             ) from exc
-        self._bucket = gcs.Client().bucket(bucket)
+        try:
+            self._bucket = gcs.Client().bucket(bucket)
+        except Exception as exc:  # noqa: BLE001 — no ADC/credentials, fail closed
+            raise StorageNotConfigured(
+                "STORAGE_BACKEND=gcs: could not build a GCS client "
+                f"({type(exc).__name__}: {exc}); configure ADC or "
+                "GOOGLE_APPLICATION_CREDENTIALS"
+            ) from exc
 
     def download(self, key: str) -> bytes:
         blob = self._bucket.blob(key)
@@ -225,6 +248,27 @@ class _LiveGCSBlobStore:
 
     def upload(self, key: str, data: bytes, content_type: str) -> None:
         self._bucket.blob(key).upload_from_string(data, content_type=content_type)
+
+    def delete(self, key: str) -> None:
+        from google.api_core.exceptions import NotFound
+
+        try:
+            self._bucket.blob(key).delete()
+        except NotFound:
+            pass  # already gone — callers treat delete as idempotent
+
+    def sign_put_url(self, key: str, content_type: str, expires_seconds: int) -> str:
+        from datetime import timedelta
+
+        # No content_type constraint on the URL: the client PUTs whatever it
+        # declared at sign time, and finalize re-uploads with the detected
+        # type anyway. Constraining it would 403 clients that don't echo the
+        # exact header.
+        return self._bucket.blob(key).generate_signed_url(
+            version="v4",
+            expiration=timedelta(seconds=expires_seconds),
+            method="PUT",
+        )
 
 
 class GCSStorage:
@@ -237,10 +281,15 @@ class GCSStorage:
     """
 
     def __init__(self, bucket: str | None = None, _blob_store: GCSBlobStore | None = None):
-        self.bucket = bucket or os.environ.get("GCS_BUCKET")
+        self.bucket = bucket or get_settings().gcs_bucket or os.environ.get("GCS_BUCKET")
         if not self.bucket:
             raise StorageNotConfigured("GCS_BUCKET is not set")
         self._blob_store = _blob_store
+
+    @property
+    def blob_store(self) -> GCSBlobStore:
+        """The blob I/O seam (live client or injected fake)."""
+        return self._store()
 
     def _store(self) -> GCSBlobStore:
         if self._blob_store is not None:
@@ -248,7 +297,27 @@ class GCSStorage:
         return _LiveGCSBlobStore(self.bucket)
 
     def sign_upload(self, uid: str, content_type: str, size_bytes: int) -> dict:
-        raise StorageNotConfigured("GCS signed-URL minting is not wired in this environment")
+        ext = ALLOWED_CONTENT_TYPES.get(content_type.lower())
+        if not ext:
+            raise StorageError(f"unsupported content type: {content_type}")
+        if not (0 < size_bytes <= MAX_IMAGE_BYTES):
+            raise StorageError(f"size must be within 1..{MAX_IMAGE_BYTES} bytes")
+        key = f"u/{uid}/{uuid.uuid4().hex}.{ext}"
+        try:
+            upload_url = self.blob_store.sign_put_url(
+                key, content_type, SIGN_URL_TTL_SECONDS)
+        except StorageNotConfigured:
+            raise
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — client-lib errors, safe 501
+            raise StorageNotConfigured(
+                f"could not mint a GCS signed URL: {type(exc).__name__}") from exc
+        return {
+            "upload_url": upload_url,
+            "key": key,
+            "public_url": f"https://storage.googleapis.com/{self.bucket}/{key}",
+        }
 
     def store_raw(self, key: str, data: bytes) -> None:
         raise StorageNotConfigured("GCS backend has no local raw-PUT path")
