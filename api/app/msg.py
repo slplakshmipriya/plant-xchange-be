@@ -121,13 +121,64 @@ class MessageRepo(Protocol):
     def counts_for_threads(self, thread_ids: list[str]) -> dict[str, int]: ...
 
 
-def _serialize_thread(row: dict[str, Any], message_count: int = 0,
-                      listing: dict[str, Any] | None = None) -> dict[str, Any]:
+def _last_message_preview(repo: MessageRepo, thread_id: str,
+                          count: int) -> tuple[str, str | None]:
+    """Preview text + timestamp of the thread's last message.
+
+    Decrypts one message (fail soft: a bad row yields an empty preview, never
+    a 500 on the thread list). Deleted messages and photos get fixed labels.
+    """
+    if count <= 0:
+        return "", None
+    rows = repo.list_messages(thread_id, count - 1, 1)
+    if not rows:
+        return "", None
+    last = rows[0]
+    at = last.get("created_at")
+    if last.get("deleted_at"):
+        return "Message deleted", at
+    kind = last.get("kind", "text")
+    if kind == "photo":
+        return "Photo", at
+    if kind == "system":
+        return "System update", at
+    try:
+        body = decrypt_text(last["body"], MESSAGE_KEY_ENV)
+    except Exception:  # noqa: BLE001 — fail soft, see docstring
+        return "", at
+    return (body[:80] + "…" if len(body) > 80 else body), at
+
+
+def _other_uids_for_threads(threads: list[dict[str, Any]],
+                            listing_by_id: dict[str, dict[str, Any]],
+                            viewer_uid: str) -> dict[str, str | None]:
+    """Map thread id -> the other participant's uid, relative to the viewer."""
+    out: dict[str, str | None] = {}
+    for t in threads:
+        listing = listing_by_id.get(str(t["listing_id"]))
+        participants = {t["created_by"]}
+        owner_uid = listing.get("owner_uid") if listing else None
+        if owner_uid:
+            participants.add(owner_uid)
+        others = sorted(u for u in participants if u != viewer_uid)
+        out[str(t["id"])] = others[0] if others else None
+    return out
+
+
+def _serialize_thread(row: dict[str, Any], viewer_uid: str,
+                      message_count: int = 0,
+                      listing: dict[str, Any] | None = None,
+                      other_user: dict[str, Any] | None = None,
+                      last_preview: str = "",
+                      last_at: str | None = None) -> dict[str, Any]:
     # No geo fields, ever (API-080).
     participants = {row["created_by"]}
     owner_uid = listing.get("owner_uid") if listing else None
     if owner_uid:
         participants.add(owner_uid)
+    others = sorted(u for u in participants if u != viewer_uid)
+    other_uid = others[0] if others else None
+    other = other_user or {}
     return {
         "id": str(row["id"]),
         "listing_id": str(row["listing_id"]),
@@ -135,6 +186,14 @@ def _serialize_thread(row: dict[str, Any], message_count: int = 0,
         "created_at": row.get("created_at"),
         "message_count": message_count,
         "participant_uids": sorted(participants),
+        "participant_user_id": other_uid,
+        "other_display_name": other.get("display_name") or "Neighbor",
+        "other_avatar_url": other.get("avatar_url"),
+        "listing_variety": (listing.get("variety") if listing else None) or "Listing",
+        "listing_credit_cost": (listing.get("credit_cost") if listing else 0) or 0,
+        "listing_status": (listing.get("status") if listing else None) or "",
+        "last_message_preview": last_preview,
+        "last_message_at": last_at,
     }
 
 
@@ -393,7 +452,12 @@ def open_thread(
         raise HTTPException(400, {"code": "profile_required",
                                   "message": "Create a profile (POST /v1/users) before messaging"})
     thread = repo.get_or_create_thread(data.listing_id, uid)
-    return _serialize_thread(thread, repo.count_messages(thread["id"]), listing)
+    count = repo.count_messages(thread["id"])
+    other_uids = _other_uids_for_threads([thread], {str(listing["id"]): listing}, uid)
+    other_uid = other_uids[str(thread["id"])]
+    other_user = user_repo.get(other_uid) if other_uid else None
+    preview, last_at = _last_message_preview(repo, str(thread["id"]), count)
+    return _serialize_thread(thread, uid, count, listing, other_user, preview, last_at)
 
 
 @router.get("/threads", tags=["messaging"])
@@ -401,6 +465,7 @@ def list_threads(
     uid: str = Depends(get_current_uid),
     repo: MessageRepo = Depends(get_message_repo),
     listing_repo: ListingRepo = Depends(get_listing_repo),
+    user_repo: UserRepo = Depends(get_user_repo),
 ) -> dict[str, Any]:
     """Threads you opened plus threads on your listings."""
     # M10a: one listing query (the owned set) and one COUNT query for all
@@ -412,13 +477,29 @@ def list_threads(
     owned_map = {str(l["id"]): l for l in owned}
     threads = repo.list_threads_for(uid, owned_ids)
     counts = repo.counts_for_threads([str(t["id"]) for t in threads])
-    out = []
+    listing_by_id = dict(owned_map)
     for t in threads:
         lid = str(t["listing_id"])
-        listing = owned_map.get(lid)
-        if listing is None:
+        if lid not in listing_by_id:
             listing = listing_repo.get(lid)
-        out.append(_serialize_thread(t, counts.get(str(t["id"]), 0), listing))
+            if listing is not None:
+                listing_by_id[lid] = listing
+    # One batched user read for every "other" participant's display
+    # name/avatar, plus one last-message preview per thread.
+    other_uids = _other_uids_for_threads(threads, listing_by_id, uid)
+    users_by_uid = user_repo.get_many(
+        [u for u in other_uids.values() if u is not None])
+    out = []
+    for t in threads:
+        tid = str(t["id"])
+        listing = listing_by_id.get(str(t["listing_id"]))
+        count = counts.get(tid, 0)
+        other_uid = other_uids[tid]
+        preview, last_at = _last_message_preview(repo, tid, count)
+        out.append(_serialize_thread(
+            t, uid, count, listing,
+            users_by_uid.get(other_uid) if other_uid else None,
+            preview, last_at))
     return {"threads": out}
 
 

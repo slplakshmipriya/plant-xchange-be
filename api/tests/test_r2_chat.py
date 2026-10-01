@@ -290,16 +290,37 @@ def test_thread_responses_include_participant_uids(chat_client):
     opened = chat_client.post("/v1/threads", json={"listing_id": lid}, headers=BOB).json()
     assert opened["id"] == tid
     assert opened["participant_uids"] == ["alice", "bob"]
+    assert opened["participant_user_id"] == "alice"
+    # Bob sees the listing owner's display name, not "Neighbor".
+    assert opened["other_display_name"] == "Alice"
 
     # List view carries them too, for both sides of the conversation.
-    for headers in (BOB, ALICE):
+    for headers, other, other_id in ((BOB, "Alice", "alice"), (ALICE, "Bob", "bob")):
         threads = chat_client.get("/v1/threads", headers=headers).json()["threads"]
         mine = next(t for t in threads if t["id"] == tid)
         assert mine["participant_uids"] == ["alice", "bob"]
+        assert mine["participant_user_id"] == other_id
+        assert mine["other_display_name"] == other
+
+    # Avatar URL flows through when the other side set one.
+    r = chat_client.patch("/v1/users/me",
+                          json={"avatar_url": "https://example.com/alice.png"},
+                          headers=ALICE)
+    assert r.status_code == 200, r.text
+    threads = chat_client.get("/v1/threads", headers=BOB).json()["threads"]
+    mine = next(t for t in threads if t["id"] == tid)
+    assert mine["other_avatar_url"] == "https://example.com/alice.png"
+
+    # Last-message preview decrypts the latest text (empty before any message).
+    assert mine["last_message_preview"] == ""
 
     # Existing fields are untouched.
     assert set(opened) == {"id", "listing_id", "created_by", "created_at",
-                           "message_count", "participant_uids"}
+                           "message_count", "participant_uids",
+                           "participant_user_id", "other_display_name",
+                           "other_avatar_url", "listing_variety",
+                           "listing_credit_cost", "listing_status",
+                           "last_message_preview", "last_message_at"}
     assert opened["created_by"] == "bob"
 
 
