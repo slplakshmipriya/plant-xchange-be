@@ -33,6 +33,8 @@ class Settings:
                                    # test-only stub IDV route/provider (default OFF)
     storage_backend: str           # STORAGE_BACKEND: "local" stub or "gcs"
     uploads_dir: str               # UPLOADS_DIR: local stub upload root
+    gcs_bucket: str | None         # GCS_BUCKET: object-storage bucket for listing photos
+    gcs_max_bytes: int             # GCS_MAX_BYTES: bucket quota cap (default 5 GiB Spark free tier)
     user_tz: str                   # USER_TZ: IANA tz for quiet-hours evaluation
     notify_daily_cap: int          # NOTIFY_DAILY_CAP: max notifications per user per day
     # --- Stripe Connect seam (API-071; stub until wired) ---
@@ -54,6 +56,8 @@ def get_settings() -> Settings:
         idv_stub_enabled=os.environ.get("ENABLE_IDV_STUB", "0") == "1",
         storage_backend=os.environ.get("STORAGE_BACKEND", "local"),
         uploads_dir=os.environ.get("UPLOADS_DIR", "var/uploads"),
+        gcs_bucket=os.environ.get("GCS_BUCKET"),
+        gcs_max_bytes=_int("GCS_MAX_BYTES", 5_368_709_120),
         user_tz=os.environ.get("USER_TZ", "America/New_York"),
         notify_daily_cap=_int("NOTIFY_DAILY_CAP", 5),
         payment_provider=os.environ.get("PAYMENT_PROVIDER", "stub"),

@@ -10,5 +10,8 @@ firebase-admin==7.1.0
 PyYAML==6.0.2
 # Image validation + EXIF GPS stripping for listing photos (API-022)
 pillow==12.3.0
+# GCS object storage for listing photos (STORAGE_BACKEND=gcs). Lazily
+# imported — dev/CI without credentials keep working; prod must install it.
+google-cloud-storage==3.15.1
 # At-rest field encryption: message bodies + listing geo (Fernet/AES-256-GCM)
 cryptography==44.0.1
