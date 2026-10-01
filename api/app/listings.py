@@ -1003,6 +1003,8 @@ def cancel_listing(
     listing_id: str,
     uid: str = Depends(get_current_uid),
     repo: ListingRepo = Depends(get_listing_repo),
+    images_repo: StoredImagesRepo = Depends(get_images_repo),
+    blob_store: GCSBlobStore | None = Depends(get_blob_store_or_none),
 ) -> dict[str, Any]:
     row = repo.get(listing_id)
     if row is None:
@@ -1011,7 +1013,16 @@ def cancel_listing(
     if not can_transition(row["status"], "cancelled"):
         raise HTTPException(422, {"code": "invalid_transition",
                                   "message": f"Cannot cancel a listing in status '{row['status']}'"})
-    return public_listing(repo.set_status(listing_id, "cancelled"), viewer_uid=uid)
+    updated = repo.set_status(listing_id, "cancelled")
+    # Cancelled is terminal: the photos no longer back an active listing.
+    # Refcounted release (no-op unless STORAGE_BACKEND=gcs).
+    release_listing_images(
+        (updated or row).get("photos") or [],
+        images_repo=images_repo,
+        blob_store=blob_store,
+        bucket=get_settings().gcs_bucket,
+    )
+    return public_listing(updated, viewer_uid=uid)
 
 
 # Epsilon for the "fully picked" check (M5a): NUMERIC arithmetic is exact,

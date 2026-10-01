@@ -350,6 +350,49 @@ def test_exchange_confirm_completion_releases_images(gcs_client):
     assert ns.images.get_by_gcs_key(key) is None
 
 
+# --- release on listing cancel (the app's delete path) --------------------------
+
+def test_cancel_listing_releases_images(gcs_client):
+    ns = gcs_client
+    ns.users.upsert("alice", display_name="Alice")
+    meta = _finalize(ns, _png(21))
+    key = meta["public_url"].split("test-bucket/")[1]
+
+    r = ns.client.post("/v1/listings", json=_harvest_payload([meta["public_url"]]),
+                       headers=HEADERS)
+    assert r.status_code == 201, r.text
+    lid = r.json()["id"]
+
+    cancelled = ns.client.post(f"/v1/listings/{lid}/cancel", headers=HEADERS)
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
+
+    assert key in ns.fake.deleted
+    assert key not in ns.fake.objects
+    assert ns.images.get_by_gcs_key(key) is None
+
+
+def test_cancel_listing_keeps_image_shared_with_other_listing(gcs_client):
+    ns = gcs_client
+    ns.users.upsert("alice", display_name="Alice")
+    meta = _finalize(ns, _png(22))
+    _finalize(ns, _png(22))  # duplicate -> refcount 2 (shared)
+    key = meta["public_url"].split("test-bucket/")[1]
+
+    r = ns.client.post("/v1/listings", json=_harvest_payload([meta["public_url"]]),
+                       headers=HEADERS)
+    assert r.status_code == 201, r.text
+    lid = r.json()["id"]
+
+    cancelled = ns.client.post(f"/v1/listings/{lid}/cancel", headers=HEADERS)
+    assert cancelled.status_code == 200, cancelled.text
+
+    # refcount 2 -> 1: the object survives for the other listing.
+    assert key not in ns.fake.deleted
+    assert key in ns.fake.objects
+    assert ns.images.get_by_gcs_key(key)["refcount"] == 1
+
+
 # --- release on account deletion ----------------------------------------------
 
 def test_delete_me_releases_listing_images(gcs_client):
