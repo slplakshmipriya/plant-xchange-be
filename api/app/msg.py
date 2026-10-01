@@ -411,17 +411,24 @@ def attach_photo(
 
     1. Key shape: must match the upload key format. Arbitrary external URLs
        (http(s) or otherwise) are rejected with 422.
-    2. Ownership: the key's ``<uid>`` segment must be the sender — 403
-       otherwise.
-    3. Pipeline: ``storage.finalize`` is (re-)run server-side. It proves the
-       bytes exist, are a real image within the size cap, and — crucially —
-       writes back the GPS-stripped rendition, so the attached bytes are
-       guaranteed EXIF-clean no matter what the client did. ``finalize`` is
-       idempotent, so keys the client already finalized are unaffected; keys
-       the client PUT but never finalized are completed here rather than
-       rejected. Missing/corrupt/oversize bytes -> 422; unconfigured
-       storage -> 501. The key is then marked finalized in the uploads
-       registry (C7) so ``GET /v1/uploads/public/{key}`` serves it.
+    2. Ownership: the uploads registry must show the sender ran this key
+       through the finalize pipeline — their own upload, or a dedupe survivor
+       key the pipeline handed back for their byte-identical bytes
+       (``finalize_upload`` records the pipeline-produced key under the
+       sender's uid). A bare uid-segment comparison is stale here: perceptual
+       dedupe intentionally shares one stored object across users. 403
+       otherwise. As a fallback the key's own uid segment is also accepted,
+       so the original uploader keeps working even after a later deduper's
+       finalize re-points the single-owner registry row at themselves.
+    3. Pipeline: when the key is already finalized, the bytes are proven
+       EXIF-clean and the public URL is derived directly — re-running
+       ``storage.finalize`` would pointlessly re-upload shared bytes (and trip
+       ``_check_key`` on the survivor's foreign uid segment). Otherwise
+       ``storage.finalize`` is (re-)run server-side as a backstop: it proves
+       the bytes exist, are a real image within the size cap, and writes back
+       the GPS-stripped rendition. Missing/corrupt/oversize bytes -> 422;
+       unconfigured storage -> 501. The key is then marked finalized in the
+       uploads registry (C7) so ``GET /v1/uploads/public/{key}`` serves it.
 
     The public URL is derived server-side from the finalize metadata and
     stored as the message body (encrypted at rest, as before) and as
@@ -438,22 +445,28 @@ def attach_photo(
         raise HTTPException(422, {"code": "invalid_upload_key",
                                   "message": "uploadKey must be a /v1/uploads key "
                                              "(u/<uid>/<id>.<ext>); arbitrary URLs are rejected"})
-    if key.split("/")[1] != uid:
+    if registry.owner_of(key) != uid and key.split("/")[1] != uid:
         raise HTTPException(403, {"code": "not_your_upload",
                                   "message": "Upload key does not belong to the sender"})
-    try:
-        meta = get_storage().finalize(uid, key)
-    except StorageNotConfigured as exc:
-        raise HTTPException(501, {"code": "storage_not_configured",
-                                  "message": str(exc)})
-    except StorageError as exc:
-        raise HTTPException(422, {"code": "invalid_upload",
-                                  "message": str(exc)})
-    # C7 registry: the attach-time finalize proves the bytes are EXIF-clean,
-    # so record the key as finalized — otherwise serve_public would 404 it.
-    registry.record_raw(key, uid)
-    registry.mark_finalized(key)
-    public_url = meta["public_url"]
+    if registry.is_finalized(key):
+        # Already EXIF-clean via an earlier finalize (own or deduped): the
+        # re-finalize backstop below exists to catch clients that skipped
+        # finalize, so there is nothing left for it to prove.
+        public_url = get_storage().public_url_for(key)
+    else:
+        try:
+            meta = get_storage().finalize(uid, key)
+        except StorageNotConfigured as exc:
+            raise HTTPException(501, {"code": "storage_not_configured",
+                                      "message": str(exc)})
+        except StorageError as exc:
+            raise HTTPException(422, {"code": "invalid_upload",
+                                      "message": str(exc)})
+        # C7 registry: the attach-time finalize proves the bytes are EXIF-clean,
+        # so record the key as finalized — otherwise serve_public would 404 it.
+        registry.record_raw(key, uid)
+        registry.mark_finalized(key)
+        public_url = meta["public_url"]
     # L7: public_url is ASCII by construction (scheme://host/path, with any
     # non-ASCII percent-encoded), so storing it as the encrypted body stays
     # well under the ciphertext CHECK — unlike free multibyte text, which is

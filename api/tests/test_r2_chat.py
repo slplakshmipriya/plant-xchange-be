@@ -240,6 +240,48 @@ def test_attachment_rejects_foreign_or_missing_upload_key(chat_client, uploads_d
     assert r.json()["code"] == "invalid_upload"
 
 
+def test_attachment_accepts_dedupe_survivor_key_from_other_user(chat_client, uploads_dir):
+    """Perceptual dedupe: Bob uploaded identical bytes first; Alice's finalize
+    deleted her temp bytes and handed back Bob's key (``deduped: true``),
+    recording (survivor_key, owner=alice, finalized) in the registry — exactly
+    what ``finalize_upload`` does on the GCS dedupe path. Attaching that key
+    must succeed: Alice demonstrably possessed the bytes and ran the pipeline;
+    the old uid-segment check wrongly 403'd this as ``not_your_upload``."""
+    from app import uploads as uploads_mod
+    tid = _thread_id(chat_client, _listing_id(chat_client))
+    bob_key, _ = _finalized_key(chat_client, BOB, _plain_png(), "image/png")
+    assert bob_key.startswith("u/bob/")
+    # Simulate Alice's dedupe finalize: survivor key recorded under HER uid.
+    registry = chat_client.app.dependency_overrides[uploads_mod.get_uploads_registry]()
+    registry.record_raw(bob_key, "alice")
+    registry.mark_finalized(bob_key)
+
+    r = chat_client.post(f"/v1/threads/{tid}/attachments",
+                         json={"uploadKey": bob_key}, headers=ALICE)
+    assert r.status_code == 201, r.text
+    msg = r.json()
+    assert msg["kind"] == "photo"
+    assert msg["photo_url"] == f"/v1/uploads/public/{bob_key}"
+    assert msg["sender_uid"] == "alice"
+
+
+def test_attachment_original_uploader_survives_dedupe_clobber(chat_client, uploads_dir):
+    """The single-owner registry row gets re-pointed at the deduper, but the
+    original uploader must still be able to attach their own key — via the
+    uid-segment fallback."""
+    from app import uploads as uploads_mod
+    tid = _thread_id(chat_client, _listing_id(chat_client))
+    bob_key, _ = _finalized_key(chat_client, BOB, _plain_png(), "image/png")
+    registry = chat_client.app.dependency_overrides[uploads_mod.get_uploads_registry]()
+    registry.record_raw(bob_key, "alice")  # Alice's dedupe clobbers the row
+    registry.mark_finalized(bob_key)
+
+    r = chat_client.post(f"/v1/threads/{tid}/attachments",
+                         json={"uploadKey": bob_key}, headers=BOB)
+    assert r.status_code == 201, r.text
+    assert r.json()["photo_url"] == f"/v1/uploads/public/{bob_key}"
+
+
 def test_thread_responses_include_participant_uids(chat_client):
     lid = _listing_id(chat_client)
     tid = _thread_id(chat_client, lid)

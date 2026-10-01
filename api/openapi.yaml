@@ -1967,19 +1967,26 @@ paths:
         \ by\n``POST /v1/uploads/sign`` — never a URL.\n\nServer-side verification,\
         \ in order:\n\n1. Key shape: must match the upload key format. Arbitrary external\
         \ URLs\n   (http(s) or otherwise) are rejected with 422.\n2. Ownership: the\
-        \ key's ``<uid>`` segment must be the sender — 403\n   otherwise.\n3. Pipeline:\
-        \ ``storage.finalize`` is (re-)run server-side. It proves the\n   bytes exist,\
-        \ are a real image within the size cap, and — crucially —\n   writes back\
-        \ the GPS-stripped rendition, so the attached bytes are\n   guaranteed EXIF-clean\
-        \ no matter what the client did. ``finalize`` is\n   idempotent, so keys the\
-        \ client already finalized are unaffected; keys\n   the client PUT but never\
-        \ finalized are completed here rather than\n   rejected. Missing/corrupt/oversize\
-        \ bytes -> 422; unconfigured\n   storage -> 501. The key is then marked finalized\
-        \ in the uploads\n   registry (C7) so ``GET /v1/uploads/public/{key}`` serves\
-        \ it.\n\nThe public URL is derived server-side from the finalize metadata\
-        \ and\nstored as the message body (encrypted at rest, as before) and as\n\
-        ``photo_url`` — the client never supplies a URL. Participant and support\n\
-        visibility are unchanged."
+        \ uploads registry must show the sender ran this key\n   through the finalize\
+        \ pipeline — their own upload, or a dedupe survivor\n   key the pipeline handed\
+        \ back for their byte-identical bytes\n   (``finalize_upload`` records the\
+        \ pipeline-produced key under the\n   sender's uid). A bare uid-segment comparison\
+        \ is stale here: perceptual\n   dedupe intentionally shares one stored object\
+        \ across users. 403\n   otherwise. As a fallback the key's own uid segment\
+        \ is also accepted,\n   so the original uploader keeps working even after\
+        \ a later deduper's\n   finalize re-points the single-owner registry row at\
+        \ themselves.\n3. Pipeline: when the key is already finalized, the bytes are\
+        \ proven\n   EXIF-clean and the public URL is derived directly — re-running\n\
+        \   ``storage.finalize`` would pointlessly re-upload shared bytes (and trip\n\
+        \   ``_check_key`` on the survivor's foreign uid segment). Otherwise\n   ``storage.finalize``\
+        \ is (re-)run server-side as a backstop: it proves\n   the bytes exist, are\
+        \ a real image within the size cap, and writes back\n   the GPS-stripped rendition.\
+        \ Missing/corrupt/oversize bytes -> 422;\n   unconfigured storage -> 501.\
+        \ The key is then marked finalized in the\n   uploads registry (C7) so ``GET\
+        \ /v1/uploads/public/{key}`` serves it.\n\nThe public URL is derived server-side\
+        \ from the finalize metadata and\nstored as the message body (encrypted at\
+        \ rest, as before) and as\n``photo_url`` — the client never supplies a URL.\
+        \ Participant and support\nvisibility are unchanged."
       operationId: attach_photo_v1_threads__thread_id__attachments_post
       parameters:
       - name: thread_id

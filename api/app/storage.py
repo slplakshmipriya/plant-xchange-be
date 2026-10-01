@@ -80,6 +80,12 @@ class StorageBackend(Protocol):
         """Validate + strip GPS EXIF. Returns metadata incl. public/thumb URLs."""
         ...
 
+    def public_url_for(self, key: str) -> str:
+        """Public URL for an already-finalized key. Pure derivation — no I/O,
+        no validation, no EXIF work. Used when the uploads registry already
+        proves the key went through finalize."""
+        ...
+
 
 def _check_key(key: str, uid: str) -> None:
     if not KEY_RE.match(key):
@@ -148,6 +154,9 @@ class LocalStubStorage:
         """Resolved path for serving a finalized upload."""
         _check_key_format(key)
         return self._path(key)
+
+    def public_url_for(self, key: str) -> str:
+        return f"/v1/uploads/public/{key}"
 
     def sign_upload(self, uid: str, content_type: str, size_bytes: int) -> dict:
         ext = ALLOWED_CONTENT_TYPES.get(content_type.lower())
@@ -352,6 +361,9 @@ class GCSStorage:
             "gps_stripped": gps_removed,
         }
 
+    def public_url_for(self, key: str) -> str:
+        return f"https://storage.googleapis.com/{self.bucket}/{key}"
+
 
 def validate_storage_config(settings: Settings) -> None:
     """Fail-closed storage deployment check (H5).
@@ -411,6 +423,15 @@ class UploadsRegistry(Protocol):
         """True only when a finalize record exists and is finalized."""
         ...
 
+    def owner_of(self, key: str) -> str | None:
+        """Uid that ran this key through the finalize pipeline (their own
+        upload, or a dedupe survivor the pipeline handed back for their
+        byte-identical bytes). None when the key was never finalized by
+        anyone. This is the server's own record — it is what the chat attach
+        endpoint uses for the ownership check instead of the key's uid
+        segment, which goes stale under perceptual dedupe sharing."""
+        ...
+
 
 class MemoryUploadsRegistry:
     """In-memory registry: tests and dev runs without Postgres."""
@@ -430,6 +451,10 @@ class MemoryUploadsRegistry:
     def is_finalized(self, key: str) -> bool:
         row = self._rows.get(key)
         return row is not None and bool(row["finalized"])
+
+    def owner_of(self, key: str) -> str | None:
+        row = self._rows.get(key)
+        return row["owner_uid"] if row is not None else None
 
 
 class PostgresUploadsRegistry:
@@ -460,3 +485,10 @@ class PostgresUploadsRegistry:
             (key,),
         ).fetchall()
         return bool(rows) and bool(rows[0]["finalized"])
+
+    def owner_of(self, key: str) -> str | None:
+        rows = self._conn.execute(
+            "SELECT owner_uid FROM uploads WHERE key = %s",
+            (key,),
+        ).fetchall()
+        return rows[0]["owner_uid"] if rows else None
