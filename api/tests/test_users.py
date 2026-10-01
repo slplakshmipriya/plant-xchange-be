@@ -125,6 +125,7 @@ def mem_c6(client, mock_verify_ab):
     """
     from app import claims as claims_mod
     from app import credits as credits_mod
+    from app import images as images_mod
     from app import listings as listings_mod
     from app import msg as msg_mod
     from app import notify as notify_mod
@@ -139,6 +140,7 @@ def mem_c6(client, mock_verify_ab):
         "notify": notify_mod.MemoryNotificationRepo(),
         "msg": msg_mod.MemoryMessageRepo(),
         "credits": credits_mod.MemoryCreditRepo(),
+        "images": images_mod.MemoryStoredImagesRepo(),
     }
     client.app.dependency_overrides[users_mod.get_user_repo] = lambda: repos["users"]
     client.app.dependency_overrides[users_mod._listing_repo] = lambda: repos["listings"]
@@ -146,6 +148,8 @@ def mem_c6(client, mock_verify_ab):
     client.app.dependency_overrides[users_mod._want_repo] = lambda: repos["want"]
     client.app.dependency_overrides[users_mod._notification_repo] = lambda: repos["notify"]
     client.app.dependency_overrides[users_mod._message_repo] = lambda: repos["msg"]
+    client.app.dependency_overrides[users_mod._images_repo] = lambda: repos["images"]
+    client.app.dependency_overrides[users_mod._blob_store] = lambda: None
     client.app.dependency_overrides[credits_mod.get_credit_repo] = lambda: repos["credits"]
     return client, repos
 

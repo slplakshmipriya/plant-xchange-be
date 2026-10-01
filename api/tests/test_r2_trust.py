@@ -18,6 +18,7 @@ def mem_trust(client, monkeypatch):
     from app import wantlist as wantlist_mod
     from app import claims as claims_mod
     from conftest import wire_credit_repo
+    from conftest import wire_images_repo
     import app.auth as auth_mod
 
     mrepo = moderation_mod.MemoryModerationRepo()
@@ -26,6 +27,7 @@ def mem_trust(client, monkeypatch):
     wrepo = wantlist_mod.MemoryWantRepo()
     nrepo = notify_mod.MemoryNotificationRepo()
     crepo = wire_credit_repo(client)
+    wire_images_repo(client)
     claim_repo = claims_mod.MemoryClaimRepo()
     client.app.dependency_overrides[moderation_mod.get_moderation_repo] = lambda: mrepo
     client.app.dependency_overrides[claims_mod.get_claim_repo] = lambda: claim_repo

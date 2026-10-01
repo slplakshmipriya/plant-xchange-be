@@ -82,7 +82,13 @@ paths:
 
         0024 adds the two FKs that were missing); the in-memory repos used in
 
-        tests mirror that cascade. Idempotent: deleting twice still returns 204.'
+        tests mirror that cascade. The user''s listings'' photos are
+
+        refcount-released from GCS *before* the cascade (after the rows are gone
+
+        there is nothing left to read the photo URLs from). Idempotent: deleting
+
+        twice still returns 204.'
       operationId: delete_me_v1_users_me_delete
       responses:
         '204':
@@ -613,7 +619,11 @@ paths:
 
         garbage-collected from the uploads registry (unserved after the C7
 
-        registry gate) with the listing''s photo list cleared. The credit ledger,
+        registry gate) with the listing''s photo list cleared; on the GCS backend
+
+        the stored images are additionally refcount-released (deleted only when
+
+        the last referencing listing is gone). The credit ledger,
 
         harvest_events, moderation_views, and reports/strikes/enforcement are
 

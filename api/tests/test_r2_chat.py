@@ -26,6 +26,7 @@ def chat_client(client, monkeypatch):
     from app import wantlist as wantlist_mod
     from app.storage import MemoryUploadsRegistry
     from conftest import wire_credit_repo
+    from conftest import wire_images_repo
     import app.auth as auth_mod
 
     urepo = users_mod.MemoryUserRepo()
@@ -45,6 +46,7 @@ def chat_client(client, monkeypatch):
     client.app.dependency_overrides[uploads_mod.get_uploads_registry] = \
         lambda: _uploads_registry
     wire_credit_repo(client)
+    wire_images_repo(client)
 
     def fake(token: str) -> dict:
         if token == "good-token":

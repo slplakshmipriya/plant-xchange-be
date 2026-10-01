@@ -48,8 +48,6 @@ from .storage import (
 
 logger = logging.getLogger(__name__)
 
-SIGN_URL_TTL_SECONDS = 15 * 60
-
 
 class QuotaExceeded(StorageError):
     """A finalize would push stored bytes past GCS_MAX_BYTES (HTTP 413)."""
@@ -71,7 +69,8 @@ def dhash(data: bytes) -> str:
 
     with Image.open(io.BytesIO(data)) as img:
         small = img.convert("L").resize((9, 8), Image.LANCZOS)
-        px = list(small.getdata())
+        # tobytes(): one row-major byte per pixel for mode "L".
+        px = small.tobytes()
     bits = 0
     for row in range(8):
         base = row * 9

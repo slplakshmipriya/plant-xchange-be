@@ -59,14 +59,37 @@ def wire_credit_repo(client):
     return crepo
 
 
+def wire_images_repo(client, blob_store=None):
+    """Override the stored-images repo + GCS blob store with in-memory fakes.
+
+    Required by any fixture whose tests hit routes that depend on the image
+    library (uploads finalize, exchange confirm, harvest events, sweep,
+    account deletion). ``blob_store`` defaults to None (image release
+    no-ops); pass a fake to exercise GCS deletes. Also overrides the lazy
+    ``users_mod._images_repo`` / ``users_mod._blob_store`` wrappers that
+    DELETE /v1/users/me resolves through. Returns (images_repo, blob_store).
+    """
+    from app import images as images_mod
+    from app import users as users_mod
+
+    irepo = images_mod.MemoryStoredImagesRepo()
+    client.app.dependency_overrides[images_mod.get_images_repo] = lambda: irepo
+    client.app.dependency_overrides[images_mod.get_blob_store_or_none] = lambda: blob_store
+    client.app.dependency_overrides[users_mod._images_repo] = lambda: irepo
+    client.app.dependency_overrides[users_mod._blob_store] = lambda: blob_store
+    return irepo, blob_store
+
+
 @pytest.fixture()
 def mem_users(client, monkeypatch):
     """Override the user repo with an in-memory one. Returns (client, repo)."""
     from app import users as users_mod
+    from conftest import wire_images_repo
 
     repo = users_mod.MemoryUserRepo()
     client.app.dependency_overrides[users_mod.get_user_repo] = lambda: repo
     wire_credit_repo(client)
+    wire_images_repo(client)
     return client, repo
 
 
@@ -79,6 +102,7 @@ def mem_listings(client, monkeypatch):
     from app import sitter as sitter_mod
     from app import users as users_mod
     from app import wantlist as wantlist_mod
+    from conftest import wire_images_repo
 
     urepo = users_mod.MemoryUserRepo()
     lrepo = listings_mod.MemoryListingRepo()
@@ -90,6 +114,7 @@ def mem_listings(client, monkeypatch):
     client.app.dependency_overrides[notify_mod.get_notification_repo] = lambda: nrepo
     client.app.dependency_overrides[sitter_mod.get_sitter_repo] = lambda: sitter_mod.MemorySitterRepo()
     wire_credit_repo(client)
+    wire_images_repo(client)
     return client, urepo, lrepo, wrepo, nrepo
 
 

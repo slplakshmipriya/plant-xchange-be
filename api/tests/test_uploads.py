@@ -14,13 +14,18 @@ def mem_uploads(client):
 
     The default get_uploads_registry is Postgres-backed (503 without
     DATABASE_URL); the uploads routes need this override in every test.
+    Also wires the stored-images repo + user repo that finalize depends on.
     Returns (client, registry).
     """
     from app import uploads as uploads_mod
+    from app import users as users_mod
     from app.storage import MemoryUploadsRegistry
+    from conftest import wire_images_repo
 
     repo = MemoryUploadsRegistry()
     client.app.dependency_overrides[uploads_mod.get_uploads_registry] = lambda: repo
+    wire_images_repo(client)
+    client.app.dependency_overrides[users_mod.get_user_repo] = lambda: users_mod.MemoryUserRepo()
     return client, repo
 
 

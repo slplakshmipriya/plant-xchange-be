@@ -285,6 +285,7 @@ class GCSStorage:
         if not self.bucket:
             raise StorageNotConfigured("GCS_BUCKET is not set")
         self._blob_store = _blob_store
+        self._live_store: GCSBlobStore | None = None
 
     @property
     def blob_store(self) -> GCSBlobStore:
@@ -294,7 +295,10 @@ class GCSStorage:
     def _store(self) -> GCSBlobStore:
         if self._blob_store is not None:
             return self._blob_store
-        return _LiveGCSBlobStore(self.bucket)
+        # Memoized: one gcs.Client per backend instance, not per blob op.
+        if self._live_store is None:
+            self._live_store = _LiveGCSBlobStore(self.bucket)
+        return self._live_store
 
     def sign_upload(self, uid: str, content_type: str, size_bytes: int) -> dict:
         ext = ALLOWED_CONTENT_TYPES.get(content_type.lower())

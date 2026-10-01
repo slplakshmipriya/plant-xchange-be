@@ -16,11 +16,13 @@ def mem_exchange(client, monkeypatch):
     from app import users as users_mod
     from app import wantlist as wantlist_mod
     from conftest import wire_credit_repo
+    from conftest import wire_images_repo
     import app.auth as auth_mod
 
     urepo = users_mod.MemoryUserRepo()
     lrepo = listings_mod.MemoryListingRepo()
     crepo = wire_credit_repo(client)
+    wire_images_repo(client)
     wrepo = wantlist_mod.MemoryWantRepo()
     nrepo = notify_mod.MemoryNotificationRepo()
     claim_repo = claims_mod.MemoryClaimRepo()
