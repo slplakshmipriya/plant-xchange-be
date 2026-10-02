@@ -475,7 +475,7 @@ class PostgresListingRepo:
         if entries:
             tier_join = (
                 "LEFT JOIN LATERAL ("
-                "SELECT MAX(CASE "
+                "SELECT MIN(CASE "
                 "WHEN btrim(v.variety) <> '' AND btrim(l.variety) <> '' "
                 "AND lower(btrim(l.variety)) = lower(btrim(v.variety)) THEN 0 "
                 "WHEN btrim(v.variety) <> '' AND btrim(l.variety) <> '' "
@@ -515,6 +515,8 @@ class PostgresListingRepo:
             params.append(offset)
         rows = self._conn.execute(query, params).fetchall()
         return [self._row(r) for r in rows]
+
+    def count_live(self, listing_type: str | None = None) -> int:
         query = "SELECT COUNT(*) AS n FROM listings WHERE status = 'live'"
         params: list[Any] = []
         if listing_type is not None:

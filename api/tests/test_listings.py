@@ -658,3 +658,29 @@ def test_claimer_uid_hidden_from_third_party(alice_profile, mock_verify, auth_he
     r = client.post(f"/v1/listings/{lid}/cancel", headers=auth_headers)
     assert r.status_code == 200
     assert r.json()["claimer_uid"] == "bob"
+
+
+def test_repo_implementations_cover_listing_protocol():
+    """Structural guard: every ListingRepo protocol member must exist on
+    both the Postgres and memory implementations and on the caching
+    decorator. Catches an accidentally deleted method (like the count_live
+    regression that 500'd /v1/feed) without needing a live Postgres."""
+    import typing
+
+    from app.cache import CachedListingRepo
+    from app.listings import (
+        ListingRepo,
+        MemoryListingRepo,
+        PostgresListingRepo,
+    )
+
+    # Protocol members, minus dunders and typing internals.
+    members = {
+        name for name in dir(ListingRepo)
+        if not name.startswith("_") or name == "__init__"
+    }
+    members = {m for m in members if not m.startswith("__")}
+    assert "count_live" in members and "list_live_ranked" in members
+    for impl in (MemoryListingRepo, PostgresListingRepo, CachedListingRepo):
+        missing = sorted(m for m in members if not hasattr(impl, m))
+        assert not missing, f"{impl.__name__} is missing {missing}"
