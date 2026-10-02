@@ -1,25 +1,37 @@
 """Feed & discovery (API-021).
 
-``GET /v1/feed`` returns live listings ranked by a transparent score:
+``GET /v1/feed`` returns live listings ranked in the database, globally
+across pages (no page-local rerank):
 
-- **urgency** (weight 0.6): expires soon first — PRD ranks by *time remaining*,
-  not recency. A seedling with 1 day left outranks one listed an hour ago with
-  6 days left.
-- **want-list match**: listings matching the caller's want-list come first.
-- **posting date**: newest first breaks match ties.
-- **expiry**: soonest expiry first breaks date ties (nulls last).
+1. **exact want-list matches** — the listing variety equals one of the
+   viewer's want entries (case-insensitive), the entry's type filter allows
+   the listing type (empty = any), and the listing is not the viewer's own.
+2. **inexact want-list matches** — the variety is a literal substring match
+   in either direction (case-insensitive) but not exact, same eligibility.
+3. **everything else**.
 
-Cursor pagination: opaque base64 offset cursor. Geo is fuzzed via
-``listings.public_listing`` — true coordinates never leave the server.
+Within each tier: posting date descending (nulls last), then expiry
+ascending (nulls last), then id ascending for determinism. ``LIMIT`` /
+``OFFSET`` paginate the ranked order, so a match on a later DB page still
+outranks non-matches above it.
+
+Cursor pagination: opaque base64 offset cursor over the ranked order. Geo
+is fuzzed via ``listings.public_listing`` — true coordinates never leave
+the server.
 
 ``way=sitting`` returns sitter profiles under a ``"sitters"`` key (not
 ``"listings"``).
+
+Caching: ranked feed pages are cached per viewer (``l:live:ranked:<uid>``)
+because tiers depend on the viewer's want-list — a shared key would serve
+one viewer's ranking to another. Listing writes invalidate every ``l:live``
+key (ranked pages included); want-list writes invalidate the writer's
+ranked keys. TTL bounds any residual staleness.
 """
 
 from __future__ import annotations
 
 import base64
-from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -28,7 +40,7 @@ from .auth import get_current_uid
 from .listings import ListingRepo, batch_owners, get_listing_repo, public_listing
 from .sitter import SitterRepo, _display_name, _serialize_profile, get_sitter_repo
 from .users import UserRepo, get_user_repo
-from .wantlist import WantRepo, find_matches, get_want_repo
+from .wantlist import WantRepo, get_want_repo
 
 router = APIRouter(prefix="/v1", tags=["feed"])
 
@@ -39,34 +51,6 @@ MAX_LIMIT = 50
 # "sitting" lists sitter profiles instead of listings.
 WAYS = ("seedling", "harvest", "pick", "sitting")
 _WAY_TO_LISTING_TYPE = {"seedling": "seedling", "harvest": "harvest", "pick": "tree"}
-
-
-def _parse_dt(value: Any) -> datetime | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        dt = value
-    else:
-        try:
-            dt = datetime.fromisoformat(value)
-        except (ValueError, TypeError):
-            return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def _feed_rank_key(row: dict[str, Any],
-                   entries: list[dict[str, Any]]) -> tuple[int, float, tuple]:
-    """Lexicographic feed rank: want-list match first, then newest post,
-    then soonest expiry (nulls last, id tiebreak). Deterministic and
-    testable. ``entries`` are the caller's want-list rows; ``find_matches``
-    excludes the caller's own listings and honors entry type filters.
-    """
-    matched = bool(find_matches(row, entries))
-    created = _parse_dt(row.get("created_at"))
-    created_ts = created.timestamp() if created else 0.0
-    return (0 if matched else 1, -created_ts, _expiry_key(row))
 
 
 def _encode_cursor(offset: int) -> str:
@@ -83,12 +67,6 @@ def _decode_cursor(cursor: str | None) -> int:
     if offset < 0:
         raise HTTPException(400, {"code": "invalid_cursor", "message": "Malformed feed cursor"})
     return offset
-
-
-def _expiry_key(row: dict[str, Any]) -> tuple[bool, float, str]:
-    """Freshest-first by expires_at ascending, nulls last (API-123)."""
-    dt = _parse_dt(row.get("expires_at"))
-    return (dt is None, dt.timestamp() if dt else 0.0, str(row.get("id") or ""))
 
 
 def _batch_display_names(user_repo: UserRepo, uids: list[str]) -> dict[str, str | None]:
@@ -121,16 +99,17 @@ def get_feed(
 ) -> dict[str, Any]:
     """Ranked discovery feed of live listings (fuzzed geo, no PII).
 
-    Without ``way``: the scored, cursor-paginated feed (API-021). Pagination
-    is DB-level (M9): one page of rows is fetched with limit/offset and only
-    that page is scored in Python, so per-request work stays bounded no
-    matter how large the listings table grows.
+    Without ``way``: the ranked, cursor-paginated feed (API-021). Ranking
+    happens in the database (``list_live_ranked``) so pagination walks the
+    global order: exact want-list matches, then inexact matches, then the
+    rest; each tier by newest post, then soonest expiry (nulls last).
     With ``way`` (API-123): exact ``{"listings": [...]}`` for one Explore
     way-card — except ``way=sitting``, which returns sitter profiles under a
     ``{"sitters": [...]}`` key (L4c).
 
-    Ranking (both branches): want-list matches first, then newest post,
-    then soonest expiry (nulls last).
+    Ranking (both listing branches): exact want-list matches first, then
+    inexact matches, then everything else; newest post, then soonest expiry
+    (nulls last) within each tier.
     """
     if way is not None:
         if way == "sitting":
@@ -139,18 +118,16 @@ def get_feed(
             names = _batch_display_names(user_repo, [r["uid"] for r in profiles])
             return {"sitters": [_serialize_profile(r, names.get(r["uid"]))
                                 for r in profiles[:limit]]}
-        live = repo.list_live(limit=limit, listing_type=_WAY_TO_LISTING_TYPE[way])
         entries = want_repo.list_for_user(uid)
-        ranked = sorted(live, key=lambda r: _feed_rank_key(r, entries))
-        owners = batch_owners(user_repo, ranked[:limit])
+        ranked = repo.list_live_ranked(entries, limit=limit,
+                                       listing_type=_WAY_TO_LISTING_TYPE[way])
+        owners = batch_owners(user_repo, ranked)
         return {"listings": [public_listing(r, viewer_uid=uid, owners=owners)
-                             for r in ranked[:limit]]}
+                             for r in ranked]}
 
     offset = _decode_cursor(cursor)
-    # M9: DB-level pagination — fetch one page, rank only the page.
-    page = repo.list_live(limit=limit, offset=offset)
     entries = want_repo.list_for_user(uid)
-    ranked = sorted(page, key=lambda r: _feed_rank_key(r, entries))
+    ranked = repo.list_live_ranked(entries, limit=limit, offset=offset)
     total = repo.count_live()
     next_cursor = _encode_cursor(offset + limit) if offset + limit < total else None
     owners = batch_owners(user_repo, ranked)

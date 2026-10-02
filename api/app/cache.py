@@ -225,6 +225,21 @@ class CachedListingRepo:
             lambda: self._inner.count_live(listing_type),
             TTL_LISTING)
 
+    def list_live_ranked(self, entries: list[dict[str, Any]],
+                         limit: int | None = None, offset: int = 0,
+                         listing_type: str | None = None) -> list[dict[str, Any]]:
+        # Ranked pages are viewer-specific: tiers come from the viewer's
+        # want-list, so the key carries the viewer uid (cid level) — a
+        # shared key would serve one viewer's ranking to another. The
+        # "l:live" prefix keeps listing-write invalidation covering ranked
+        # pages; want-list writes invalidate the writer's ranked keys.
+        viewer = entries[0].get("user_uid", "-") if entries else "-"
+        return cache.get_or_load(
+            f"l:live:ranked:{viewer}:{limit}:{offset}:{listing_type}",
+            lambda: self._inner.list_live_ranked(
+                entries, limit=limit, offset=offset, listing_type=listing_type),
+            TTL_LISTING)
+
     def list_by_owner(self, uid: str) -> list[dict[str, Any]]:
         return cache.get_or_load(f"l:owner:{uid}",
                                  lambda: self._inner.list_by_owner(uid),

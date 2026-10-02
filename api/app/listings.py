@@ -61,7 +61,7 @@ from .notify import (
     send_notification,
 )
 from .users import UserRepo, get_user_repo
-from .wantlist import WantRepo, find_matches, get_want_repo, notify_matches
+from .wantlist import WantRepo, find_matches, get_want_repo, match_tier, notify_matches
 
 router = APIRouter(prefix="/v1", tags=["listings"])
 internal_router = APIRouter(prefix="/v1/internal", tags=["internal"])
@@ -97,6 +97,25 @@ def _coerce_utc(value: datetime | None) -> datetime | None:
     if isinstance(value, datetime) and value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value
+
+
+def _dt_to_ts(value: Any) -> float | None:
+    """Epoch seconds for a datetime-or-ISO-string, or None when missing.
+
+    Naive values are treated as UTC (same rule as ``_coerce_utc``).
+    Unparseable values count as missing rather than raising.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(value)
+        except (ValueError, TypeError):
+            return None
+    dt = _coerce_utc(dt)
+    return dt.timestamp() if dt is not None else None
 
 
 # ---------------------------------------------------------------- geo fuzzing
@@ -263,8 +282,22 @@ class ListingRepo(Protocol):
     def list_live(self, limit: int | None = None, offset: int = 0,
                   listing_type: str | None = None) -> list[dict[str, Any]]:
         """Live listings, DB-paginated (M9). Ordered by expires_at ascending
-        (nulls last), then created_at descending — the same order the feed
-        scores within a page."""
+        (nulls last), then created_at descending. Used by non-feed readers
+        (want-matches scan, tree list); the feed uses ``list_live_ranked``."""
+        ...
+    def list_live_ranked(self, entries: list[dict[str, Any]],
+                         limit: int | None = None, offset: int = 0,
+                         listing_type: str | None = None) -> list[dict[str, Any]]:
+        """Live listings ranked for a viewer, DB-paginated over the ranked
+        order (no page-local rerank needed).
+
+        ``entries`` are the viewer's want-list rows (each with ``user_uid``,
+        ``variety``, ``types``). Tiers: 0 = exact variety match, 1 = inexact
+        (substring) match, 2 = no match; a viewer's own listings never match.
+        Within each tier: created_at DESC (nulls last), expires_at ASC
+        (nulls last), id ASC. LIMIT/OFFSET apply after the global ordering,
+        so a match on a later DB page still outranks everything above it.
+        """
         ...
     def count_live(self, listing_type: str | None = None) -> int:
         """Total live listings (M9: feed next_cursor without loading rows)."""
@@ -424,7 +457,64 @@ class PostgresListingRepo:
         rows = self._conn.execute(query, params).fetchall()
         return [self._row(r) for r in rows]
 
-    def count_live(self, listing_type: str | None = None) -> int:
+    def list_live_ranked(self, entries: list[dict[str, Any]],
+                         limit: int | None = None, offset: int = 0,
+                         listing_type: str | None = None) -> list[dict[str, Any]]:
+        # Ranked feed in one query: the viewer's want entries ride along as a
+        # VALUES lateral join, so LIMIT/OFFSET paginate the *ranked* order and
+        # a match on a later DB page still outranks everything above it.
+        # Tier per listing = best tier across eligible entries: 0 exact
+        # variety (case-insensitive), 1 inexact (literal substring either
+        # direction — position(), not LIKE, so no metacharacter escaping),
+        # 2 no match. Eligibility mirrors find_matches: the viewer's own
+        # listings never match, and the listing type must be in the entry's
+        # types (empty array = any). No eligible entry -> tier 2 (COALESCE).
+        values = ", ".join(["(%s, %s::text[], %s)"] * len(entries))
+        tier_join = ""
+        params: list[Any] = []
+        if entries:
+            tier_join = (
+                "LEFT JOIN LATERAL ("
+                "SELECT MAX(CASE "
+                "WHEN btrim(v.variety) <> '' AND btrim(l.variety) <> '' "
+                "AND lower(btrim(l.variety)) = lower(btrim(v.variety)) THEN 0 "
+                "WHEN btrim(v.variety) <> '' AND btrim(l.variety) <> '' "
+                "AND (position(lower(v.variety) IN lower(l.variety)) > 0 "
+                "OR position(lower(l.variety) IN lower(v.variety)) > 0) THEN 1 "
+                "ELSE 2 END) AS best "
+                f"FROM (VALUES {values}) AS v(variety, types, user_uid) "
+                "WHERE v.user_uid <> l.owner_uid "
+                "AND (cardinality(v.types) = 0 OR l.type = ANY(v.types))"
+                ") t ON true "
+            )
+            for e in entries:
+                params.extend([e.get("variety"), list(e.get("types") or []),
+                               e.get("user_uid")])
+        # NOTE: _SELECT ends with "FROM listings"; alias it so the lateral
+        # join can reference the listing row.
+        query = (
+            self._SELECT.replace("FROM listings", "FROM listings l", 1)
+            + " " + tier_join
+            + "WHERE l.status = 'live' "
+        )
+        if listing_type is not None:
+            query += " AND l.type = %s"
+            params.append(listing_type)
+        tier_expr = "COALESCE(t.best, 2)" if entries else "2"
+        query += (
+            f" ORDER BY {tier_expr} ASC,"
+            " l.created_at DESC NULLS LAST,"
+            " l.expires_at ASC NULLS LAST,"
+            " l.id ASC"
+        )
+        if limit is not None:
+            query += " LIMIT %s OFFSET %s"
+            params.extend([limit, offset])
+        elif offset:
+            query += " OFFSET %s"
+            params.append(offset)
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._row(r) for r in rows]
         query = "SELECT COUNT(*) AS n FROM listings WHERE status = 'live'"
         params: list[Any] = []
         if listing_type is not None:
@@ -578,6 +668,31 @@ class MemoryListingRepo:
         return sum(1 for r in self._rows.values()
                    if r.get("status") == "live"
                    and (listing_type is None or r.get("type") == listing_type))
+
+    @staticmethod
+    def _rank_key(row: dict[str, Any],
+                  entries: list[dict[str, Any]]) -> tuple:
+        """Python mirror of the Postgres ranked order: tier asc,
+        created_at DESC (nulls last), expires_at ASC (nulls last), id ASC."""
+        created = _dt_to_ts(row.get("created_at"))
+        expires = _dt_to_ts(row.get("expires_at"))
+        return (match_tier(row, entries),
+                created is None, -(created or 0.0),
+                expires is None, expires or 0.0,
+                str(row.get("id") or ""))
+
+    def list_live_ranked(self, entries: list[dict[str, Any]],
+                         limit: int | None = None, offset: int = 0,
+                         listing_type: str | None = None) -> list[dict[str, Any]]:
+        rows = [r for r in self._rows.values()
+                if r.get("status") == "live"
+                and (listing_type is None or r.get("type") == listing_type)]
+        rows.sort(key=lambda r: self._rank_key(r, entries))
+        if offset:
+            rows = rows[offset:]
+        if limit is not None:
+            rows = rows[:limit]
+        return [dict(r) for r in rows]
 
     def list_live_expiring_before(self, cutoff: datetime) -> list[dict[str, Any]]:
         out = []

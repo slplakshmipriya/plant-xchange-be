@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from .auth import ensure_owner, get_current_uid
+from .cache import cache
 from .db import get_db_conn
 from .notify import NotificationRepo, get_notification_repo, send_notification
 
@@ -26,7 +27,6 @@ router = APIRouter(prefix="/v1/want-list", tags=["want-list"])
 
 MATCH_CATEGORY = "match"
 RIPE_ALERT_CATEGORY = "ripe_alert"
-WANT_MATCH_BOOST = 1.0  # feed ranking boost for seedling matches (API-021)
 
 
 def variety_matches(want: str, listing_variety: str | None) -> bool:
@@ -214,18 +214,50 @@ def get_want_repo(conn=Depends(get_db_conn)) -> WantRepo:
     return PostgresWantRepo(conn)
 
 
+def _entry_tier(row: dict[str, Any], entry: dict[str, Any]) -> int:
+    """Match tier of one want-list entry against a listing row.
+
+    0 = exact variety match (case-insensitive equality), 1 = inexact
+    (substring in either direction, case-insensitive), 2 = no match.
+    Eligibility mirrors ``find_matches``: the entry's owner is excluded
+    (a viewer never matches their own listing) and the listing type must
+    be in the entry's types (empty = any).
+    """
+    if entry["user_uid"] == row.get("owner_uid"):
+        return 2
+    if not _matches_types(list(entry.get("types") or []), row.get("type")):
+        return 2
+    want_var = (entry.get("variety") or "").strip().lower()
+    list_var = (row.get("variety") or "").strip().lower()
+    if not want_var or not list_var:
+        return 2
+    if want_var == list_var:
+        return 0
+    if want_var in list_var or list_var in want_var:
+        return 1
+    return 2
+
+
+def match_tier(row: dict[str, Any], entries: list[dict[str, Any]]) -> int:
+    """Best match tier across entries: 0 exact, 1 inexact, 2 none.
+
+    ``entries`` are the viewer's want-list rows. Drives feed ranking;
+    ``find_matches`` (any tier < 2) keeps the boolean semantics used by
+    the want-matches endpoint and match notifications.
+    """
+    best = 2
+    for e in entries:
+        tier = _entry_tier(row, e)
+        if tier == 0:
+            return 0
+        if tier < best:
+            best = tier
+    return best
+
+
 def find_matches(row: dict[str, Any], entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Want-list entries matching a listing row. Excludes the listing owner."""
-    out = []
-    for e in entries:
-        if e["user_uid"] == row.get("owner_uid"):
-            continue
-        if not variety_matches(e["variety"], row.get("variety")):
-            continue
-        if not _matches_types(list(e.get("types") or []), row.get("type")):
-            continue
-        out.append(e)
-    return out
+    return [e for e in entries if _entry_tier(row, e) < 2]
 
 
 def notify_matches(
@@ -275,6 +307,8 @@ def create_want(
         "variety": data.variety.strip(),
         "types": data.types,
     })
+    # A new want changes the writer's feed tiers -> drop their ranked pages.
+    cache.invalidate_prefix(f"l:live:ranked:{uid}:")
     return _serialize(row)
 
 
@@ -301,7 +335,10 @@ def patch_want(
     fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
     if "variety" in fields:
         fields["variety"] = fields["variety"].strip()
-    return _serialize(repo.update(want_id, fields))
+    updated = repo.update(want_id, fields)
+    # Variety/type edits change the writer's feed tiers.
+    cache.invalidate_prefix(f"l:live:ranked:{uid}:")
+    return _serialize(updated)
 
 
 @router.delete("/{want_id}", status_code=204)
@@ -315,4 +352,6 @@ def delete_want(
         raise HTTPException(404, {"code": "want_not_found", "message": "No such want-list entry"})
     ensure_owner(row["user_uid"], uid)
     repo.delete(want_id)
+    # Removing a want changes the writer's feed tiers.
+    cache.invalidate_prefix(f"l:live:ranked:{uid}:")
     return None

@@ -890,13 +890,13 @@ paths:
       description: 'Ranked discovery feed of live listings (fuzzed geo, no PII).
 
 
-        Without ``way``: the scored, cursor-paginated feed (API-021). Pagination
+        Without ``way``: the ranked, cursor-paginated feed (API-021). Ranking
 
-        is DB-level (M9): one page of rows is fetched with limit/offset and only
+        happens in the database (``list_live_ranked``) so pagination walks the
 
-        that page is scored in Python, so per-request work stays bounded no
+        global order: exact want-list matches, then inexact matches, then the
 
-        matter how large the listings table grows.
+        rest; each tier by newest post, then soonest expiry (nulls last).
 
         With ``way`` (API-123): exact ``{"listings": [...]}`` for one Explore
 
@@ -905,9 +905,11 @@ paths:
         ``{"sitters": [...]}`` key (L4c).
 
 
-        Ranking (both branches): want-list matches first, then newest post,
+        Ranking (both listing branches): exact want-list matches first, then
 
-        then soonest expiry (nulls last).'
+        inexact matches, then everything else; newest post, then soonest expiry
+
+        (nulls last) within each tier.'
       operationId: get_feed_v1_feed_get
       parameters:
       - name: limit

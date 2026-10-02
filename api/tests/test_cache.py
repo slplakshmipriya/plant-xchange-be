@@ -223,6 +223,33 @@ def test_listing_repo_feed_caching_and_invalidation():
     assert len(repo.list_by_owner("alice")) == 2
 
 
+def test_ranked_feed_cached_per_viewer():
+    """Ranked feed pages are cached at cid (viewer-uid) level: one
+    viewer's ranking must never be served to another viewer."""
+    from app.listings import MemoryListingRepo
+
+    inner = CountingProxy(MemoryListingRepo())
+    repo = CachedListingRepo(inner)
+    repo.create({"id": "rl1", "owner_uid": "alice", "type": "seedling",
+                 "status": "live", "variety": "basil", "quantity": 1})
+    a_entries = [{"user_uid": "viewer-a", "variety": "basil", "types": []}]
+    b_entries = [{"user_uid": "viewer-b", "variety": "basil", "types": []}]
+
+    assert len(repo.list_live_ranked(a_entries, limit=20, offset=0)) == 1
+    repo.list_live_ranked(a_entries, limit=20, offset=0)
+    assert inner.reads == 1  # same viewer + page served from cache
+
+    # A different viewer gets their own cache entry, not viewer-a's ranking.
+    assert len(repo.list_live_ranked(b_entries, limit=20, offset=0)) == 1
+    assert inner.reads == 2
+
+    # A listing write invalidates ranked pages for every viewer.
+    repo.create({"id": "rl2", "owner_uid": "alice", "type": "seedling",
+                 "status": "live", "variety": "mint", "quantity": 1})
+    assert len(repo.list_live_ranked(a_entries, limit=20, offset=0)) == 2
+    assert inner.reads == 3
+
+
 def test_sitter_repo_caching_and_invalidation():
     from app.sitter import MemorySitterRepo
 
