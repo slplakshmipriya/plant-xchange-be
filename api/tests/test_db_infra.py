@@ -137,6 +137,7 @@ def test_non_uuid_path_param_returns_404_envelope(client, mock_verify, auth_head
     InvalidTextRepresentation (what the Postgres repo raises on UUID cast)
     must come back as a 404 in the uniform error envelope, not a 500."""
     from app import listings as listings_mod
+    from app import users as users_mod
 
     class ExplodingRepo(listings_mod.MemoryListingRepo):
         def get(self, listing_id):
@@ -146,6 +147,10 @@ def test_non_uuid_path_param_returns_404_envelope(client, mock_verify, auth_head
 
     client.app.dependency_overrides[listings_mod.get_listing_repo] = (
         lambda: ExplodingRepo()
+    )
+    # get_listing also resolves the user repo (owner display name/avatar).
+    client.app.dependency_overrides[users_mod.get_user_repo] = (
+        lambda: users_mod.MemoryUserRepo()
     )
     r = client.get("/v1/listings/not-a-uuid", headers=auth_headers)
     assert r.status_code == 404

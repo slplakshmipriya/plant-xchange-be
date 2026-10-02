@@ -2683,7 +2683,7 @@ components:
           title: Unit
         credit_cost:
           type: integer
-          maximum: 3.0
+          maximum: 100.0
           minimum: 1.0
           title: Credit Cost
         pickup_window:
@@ -2782,7 +2782,7 @@ components:
         credit_cost:
           anyOf:
           - type: integer
-            maximum: 3.0
+            maximum: 100.0
             minimum: 1.0
           - type: 'null'
           title: Credit Cost

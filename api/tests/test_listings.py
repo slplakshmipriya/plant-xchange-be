@@ -101,7 +101,7 @@ def test_create_requires_spray_disclosure(alice_profile, mock_verify, auth_heade
 
 def test_create_rejects_bad_credit_cost(alice_profile, mock_verify, auth_headers):
     client, _, _ = alice_profile
-    r = client.post("/v1/listings", json=_listing_payload(credit_cost=5), headers=auth_headers)
+    r = client.post("/v1/listings", json=_listing_payload(credit_cost=101), headers=auth_headers)
     assert r.status_code == 422
 
 

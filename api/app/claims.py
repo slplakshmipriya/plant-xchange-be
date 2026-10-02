@@ -46,7 +46,7 @@ from pydantic import BaseModel, Field
 from .auth import get_current_uid
 from .credits import CreditRepo, get_credit_repo
 from .db import get_db_conn
-from .listings import ListingRepo, get_listing_repo, public_listing, utcnow
+from .listings import ListingRepo, batch_owners, get_listing_repo, public_listing, utcnow
 from .moderation import ModerationRepo, get_moderation_repo, get_suspension
 from .notify import NotificationRepo, get_notification_repo, send_notification
 from .users import UserRepo, get_user_repo
@@ -520,7 +520,9 @@ def create_claim(
         ref=f"claim:{claim['id']}",
         repo=notify_repo,
     )
-    return {"listing": public_listing(updated), "claim": _public_claim(claim)}
+    return {"listing": public_listing(updated,
+                                       owners=batch_owners(user_repo, [updated])),
+            "claim": _public_claim(claim)}
 
 
 def _public_claim(claim: dict[str, Any]) -> dict[str, Any]:
@@ -585,6 +587,7 @@ def cancel_claim(
     listing_repo: ListingRepo = Depends(get_listing_repo),
     claim_repo: ClaimRepo = Depends(get_claim_repo),
     credit_repo: CreditRepo = Depends(get_credit_repo),
+    user_repo: UserRepo = Depends(get_user_repo),
 ) -> dict[str, Any]:
     """Cancel a claim before completion. Claimer or giver; the quantity is
     restored; no credits move."""
@@ -620,7 +623,9 @@ def cancel_claim(
         raise HTTPException(409, {"code": "claim_not_active",
                                   "message": "Claim was already resolved by a concurrent action"})
     updated = _restore_quantity(listing_id, float(claim["quantity"]), listing_repo)
-    return {"listing": public_listing(updated), "claim": _public_claim(claim)}
+    return {"listing": public_listing(updated,
+                                       owners=batch_owners(user_repo, [updated])),
+            "claim": _public_claim(claim)}
 
 
 @router.post("/listings/{listing_id}/claims/accept", tags=["claims"])
@@ -631,6 +636,7 @@ def accept_claim(
     listing_repo: ListingRepo = Depends(get_listing_repo),
     claim_repo: ClaimRepo = Depends(get_claim_repo),
     credit_repo: CreditRepo = Depends(get_credit_repo),
+    user_repo: UserRepo = Depends(get_user_repo),
 ) -> dict[str, Any]:
     """Giver accepts a pending claim."""
     row = listing_repo.get(listing_id)
@@ -672,7 +678,9 @@ def accept_claim(
         # Lost a race with a concurrent cancel/decline (H8).
         raise HTTPException(409, {"code": "claim_not_pending",
                                   "message": "Claim is no longer pending"})
-    return {"listing": public_listing(listing_repo.get(listing_id)),
+    accepted_listing = listing_repo.get(listing_id)
+    return {"listing": public_listing(accepted_listing,
+                                       owners=batch_owners(user_repo, [accepted_listing])),
             "claim": _public_claim(claim)}
 
 
@@ -683,6 +691,7 @@ def decline_claim(
     uid: str = Depends(get_current_uid),
     listing_repo: ListingRepo = Depends(get_listing_repo),
     claim_repo: ClaimRepo = Depends(get_claim_repo),
+    user_repo: UserRepo = Depends(get_user_repo),
 ) -> dict[str, Any]:
     """Giver declines a pending claim; the quantity is restored."""
     row = listing_repo.get(listing_id)
@@ -703,7 +712,9 @@ def decline_claim(
         raise HTTPException(409, {"code": "claim_not_pending",
                                   "message": "Claim is no longer pending"})
     updated = _restore_quantity(listing_id, float(claim["quantity"]), listing_repo)
-    return {"listing": public_listing(updated), "claim": _public_claim(claim)}
+    return {"listing": public_listing(updated,
+                                       owners=batch_owners(user_repo, [updated])),
+            "claim": _public_claim(claim)}
 
 
 @router.post("/exchanges/{listing_id}/no-show", tags=["claims"])

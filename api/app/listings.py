@@ -142,7 +142,8 @@ def fuzz_location_for_listing(lat: float, lon: float, listing_id: str) -> tuple[
 
 
 def public_listing(row: dict[str, Any], rng: random.Random | None = None,
-                   viewer_uid: str | None = None) -> dict[str, Any]:
+                   viewer_uid: str | None = None,
+                   owners: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """Public serializer: fuzzed geo, no owner PII (owner is just a uid).
 
     ``row`` carries ENCRYPTED geo (repo contract); decrypt in-process here,
@@ -151,6 +152,11 @@ def public_listing(row: dict[str, Any], rng: random.Random | None = None,
 
     Fuzzing is deterministic per listing id (M1) unless an explicit ``rng``
     is passed (tests).
+
+    ``owners`` maps owner uid -> user row (see :func:`batch_owners`); the
+    listing carries the owner's display name + avatar URL for the index
+    card and detail view. Absent (or nameless) owners fall back to
+    "Neighbor" / null so old callers keep working.
 
     L8: ``claimer_uid`` is revealed only to the listing's owner or claimer.
     Pass the viewer's uid explicitly from every PUBLIC route (feed, detail,
@@ -175,9 +181,12 @@ def public_listing(row: dict[str, Any], rng: random.Random | None = None,
     # viewer must be the owner or the claimer; everyone else gets None.
     is_party = (viewer_uid is None
                 or viewer_uid in (row.get("owner_uid"), claimer_uid))
+    owner = (owners or {}).get(row.get("owner_uid")) or {}
     return {
         "id": str(row["id"]),
         "owner_uid": row["owner_uid"],
+        "owner_display_name": owner.get("display_name") or "Neighbor",
+        "owner_avatar_url": owner.get("avatar_url"),
         "type": row["type"],
         "photos": list(row.get("photos") or []),
         "variety": row.get("variety"),
@@ -200,6 +209,27 @@ def public_listing(row: dict[str, Any], rng: random.Random | None = None,
         "plantAgeYears": row.get("plant_age_years"),
         "pickupWindowDays": row.get("pickup_window_days", 4),
     }
+
+
+def batch_owners(user_repo: UserRepo,
+                 rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Owner user rows for many listings with a single batched read (M10c).
+
+    Returns ``{owner_uid: user_row}`` for every distinct owner in ``rows``;
+    callers pass it as ``public_listing(..., owners=...)``. Prefers
+    ``UserRepo.get_many`` when the repo offers it, falling back to per-uid
+    ``get`` otherwise. Uids are de-duplicated so each user is read at most
+    once per call.
+    """
+    uids = sorted({r.get("owner_uid") for r in rows if r.get("owner_uid")})
+    if not uids:
+        return {}
+    get_many = getattr(user_repo, "get_many", None)
+    if callable(get_many):
+        by_uid = get_many(uids)
+        if isinstance(by_uid, dict):
+            return {u: (by_uid.get(u) or {}) for u in uids}
+    return {u: (user_repo.get(u) or {}) for u in uids}
 
 
 # ---------------------------------------------------------------- repository
@@ -629,7 +659,7 @@ class ListingIn(BaseModel):
     variety: str | None = Field(default=None, max_length=120)
     quantity: float | None = Field(default=None, gt=0)
     unit: str | None = Field(default=None, max_length=20)
-    credit_cost: int = Field(ge=1, le=3)
+    credit_cost: int = Field(ge=1, le=100)
     pickup_window: PickupWindow | None = None
     expires_at: datetime | None = None
     geo_lat: float | None = Field(default=None, ge=-90, le=90)
@@ -654,7 +684,7 @@ class ListingPatch(BaseModel):
     variety: str | None = Field(default=None, max_length=120)
     quantity: float | None = Field(default=None, gt=0)
     unit: str | None = Field(default=None, max_length=20)
-    credit_cost: int | None = Field(default=None, ge=1, le=3)
+    credit_cost: int | None = Field(default=None, ge=1, le=100)
     pickup_window: PickupWindow | None = None
     expires_at: datetime | None = None
     spray_disclosure: str | None = Field(default=None, min_length=1, max_length=2000)
@@ -916,17 +946,21 @@ def create_listing(
     if row["status"] == "live":
         # A listing going live is the match event (API-030).
         notify_matches(row, want_repo, notify_repo)
-    return public_listing(row, viewer_uid=uid)
+    return public_listing(row, viewer_uid=uid,
+                          owners=batch_owners(user_repo, [row]))
 
 
 @router.get("/listings/mine")
 def list_my_listings(
     uid: str = Depends(get_current_uid),
     repo: ListingRepo = Depends(get_listing_repo),
+    user_repo: UserRepo = Depends(get_user_repo),
 ) -> dict[str, Any]:
     """Listings owned by the current user, any status, newest first."""
-    return {"listings": [public_listing(r, viewer_uid=uid)
-                        for r in repo.list_by_owner(uid)]}
+    rows = repo.list_by_owner(uid)
+    owners = batch_owners(user_repo, rows)
+    return {"listings": [public_listing(r, viewer_uid=uid, owners=owners)
+                         for r in rows]}
 
 
 @router.get("/want-list/matches", tags=["want-list"])
@@ -934,6 +968,7 @@ def get_want_matches(
     uid: str = Depends(get_current_uid),
     want_repo: WantRepo = Depends(get_want_repo),
     listing_repo: ListingRepo = Depends(get_listing_repo),
+    user_repo: UserRepo = Depends(get_user_repo),
 ) -> dict[str, Any]:
     """Live listings matching the current user's want-list entries.
 
@@ -945,7 +980,9 @@ def get_want_matches(
         return {"items": []}
     matched = [row for row in listing_repo.list_live(limit=200)
                if find_matches(row, entries)]
-    return {"items": [public_listing(row, viewer_uid=uid) for row in matched]}
+    owners = batch_owners(user_repo, matched)
+    return {"items": [public_listing(row, viewer_uid=uid, owners=owners)
+                      for row in matched]}
 
 
 @router.get("/listings/{listing_id}")
@@ -953,13 +990,15 @@ def get_listing(
     listing_id: str,
     uid: str = Depends(get_current_uid),
     repo: ListingRepo = Depends(get_listing_repo),
+    user_repo: UserRepo = Depends(get_user_repo),
 ) -> dict[str, Any]:
     row = repo.get(listing_id)
     if row is None:
         raise HTTPException(404, {"code": "listing_not_found", "message": "No such listing"})
     # L8: the FirebaseAuthMiddleware guarantees an authenticated viewer here;
     # claimer_uid is hidden from everyone except owner/claimer.
-    return public_listing(row, viewer_uid=uid)
+    return public_listing(row, viewer_uid=uid,
+                          owners=batch_owners(user_repo, [row]))
 
 
 @router.patch("/listings/{listing_id}")
@@ -970,6 +1009,7 @@ def patch_listing(
     repo: ListingRepo = Depends(get_listing_repo),
     want_repo: WantRepo = Depends(get_want_repo),
     notify_repo: NotificationRepo = Depends(get_notification_repo),
+    user_repo: UserRepo = Depends(get_user_repo),
 ) -> dict[str, Any]:
     row = repo.get(listing_id)
     if row is None:
@@ -997,7 +1037,8 @@ def patch_listing(
     if updated and row["status"] != "live" and updated.get("status") == "live":
         # draft -> live is the match event (API-030).
         notify_matches(updated, want_repo, notify_repo)
-    return public_listing(updated, viewer_uid=uid)
+    return public_listing(updated, viewer_uid=uid,
+                          owners=batch_owners(user_repo, [updated]))
 
 
 @router.post("/listings/{listing_id}/cancel")
@@ -1007,6 +1048,7 @@ def cancel_listing(
     repo: ListingRepo = Depends(get_listing_repo),
     images_repo: StoredImagesRepo = Depends(get_images_repo),
     blob_store: GCSBlobStore | None = Depends(get_blob_store_or_none),
+    user_repo: UserRepo = Depends(get_user_repo),
 ) -> dict[str, Any]:
     row = repo.get(listing_id)
     if row is None:
@@ -1024,7 +1066,8 @@ def cancel_listing(
         blob_store=blob_store,
         bucket=get_settings().gcs_bucket,
     )
-    return public_listing(updated, viewer_uid=uid)
+    return public_listing(updated, viewer_uid=uid,
+                          owners=batch_owners(user_repo, [updated]))
 
 
 # Epsilon for the "fully picked" check (M5a): NUMERIC arithmetic is exact,
@@ -1045,6 +1088,7 @@ def record_harvest_event(
     repo: ListingRepo = Depends(get_listing_repo),
     images_repo: StoredImagesRepo = Depends(get_images_repo),
     blob_store: GCSBlobStore | None = Depends(get_blob_store_or_none),
+    user_repo: UserRepo = Depends(get_user_repo),
 ) -> dict[str, Any]:
     """Record kilos picked from a harvest listing (owner only, live only).
 
@@ -1087,7 +1131,8 @@ def record_harvest_event(
                 bucket=get_settings().gcs_bucket,
             )
     return {
-        "listing": public_listing(updated, viewer_uid=uid),
+        "listing": public_listing(updated, viewer_uid=uid,
+                                  owners=batch_owners(user_repo, [updated])),
         "delta_kg": data.delta_kg,
         "remaining_kg": remaining,
     }

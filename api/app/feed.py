@@ -26,7 +26,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from .auth import get_current_uid
-from .listings import ListingRepo, get_listing_repo, public_listing, utcnow
+from .listings import ListingRepo, batch_owners, get_listing_repo, public_listing, utcnow
 from .sitter import SitterRepo, _display_name, _serialize_profile, get_sitter_repo
 from .users import UserRepo, get_user_repo
 from .wantlist import WANT_MATCH_BOOST, WantRepo, get_want_repo, variety_matches
@@ -142,7 +142,9 @@ def get_feed(
                                 for r in profiles[:limit]]}
         live = repo.list_live(limit=limit, listing_type=_WAY_TO_LISTING_TYPE[way])
         ranked = sorted(live, key=_expiry_key)
-        return {"listings": [public_listing(r, viewer_uid=uid) for r in ranked[:limit]]}
+        owners = batch_owners(user_repo, ranked[:limit])
+        return {"listings": [public_listing(r, viewer_uid=uid, owners=owners)
+                             for r in ranked[:limit]]}
 
     offset = _decode_cursor(cursor)
     now = utcnow()
@@ -161,7 +163,8 @@ def get_feed(
     ranked = sorted(page, key=lambda r: (-score_listing(r, now, boost(r)), r["id"]))
     total = repo.count_live()
     next_cursor = _encode_cursor(offset + limit) if offset + limit < total else None
+    owners = batch_owners(user_repo, ranked)
     return {
-        "items": [public_listing(r, viewer_uid=uid) for r in ranked],
+        "items": [public_listing(r, viewer_uid=uid, owners=owners) for r in ranked],
         "next_cursor": next_cursor,
     }

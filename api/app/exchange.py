@@ -36,7 +36,7 @@ from .images import (
     get_images_repo,
     release_listing_images,
 )
-from .listings import ListingRepo, can_transition, get_listing_repo, public_listing
+from .listings import ListingRepo, batch_owners, can_transition, get_listing_repo, public_listing
 from .moderation import ModerationRepo, get_moderation_repo
 from .users import UserRepo, get_user_repo
 
@@ -133,7 +133,8 @@ def claim_listing(
     if updated is None:
         raise HTTPException(422, {"code": "listing_not_live",
                                   "message": "Someone just claimed this listing"})
-    return public_listing(updated)
+    return public_listing(updated,
+                          owners=batch_owners(user_repo, [updated]))
 
 
 @router.post("/exchange/confirm", tags=["credits"])
@@ -144,6 +145,7 @@ def confirm_exchange(
     credit_repo: CreditRepo = Depends(get_credit_repo),
     images_repo: StoredImagesRepo = Depends(get_images_repo),
     blob_store: GCSBlobStore | None = Depends(get_blob_store_or_none),
+    user_repo: UserRepo = Depends(get_user_repo),
 ) -> dict[str, Any]:
     """Both parties confirm; credits move exactly once when both are in."""
     if data.idempotency_key:
@@ -159,8 +161,9 @@ def confirm_exchange(
         fully_done = (spend is not None and earn is not None
                       and row0 is not None and row0["status"] == "completed")
         if fully_done or (spend is not None and row0 is None):
+            owners0 = batch_owners(user_repo, [row0]) if row0 else {}
             return {"status": "already_confirmed",
-                    "listing": public_listing(row0) if row0 else None}
+                    "listing": public_listing(row0, owners=owners0) if row0 else None}
     row = repo.get(data.listing_id)
     if row is None:
         raise HTTPException(404, {"code": "listing_not_found", "message": "No such listing"})
@@ -168,7 +171,8 @@ def confirm_exchange(
         # Repeat confirm after completion: safe no-op, not an error.
         return {"status": "completed",
                 "confirmed_by": sorted(credit_repo.confirmations(data.listing_id)),
-                "listing": public_listing(row)}
+                "listing": public_listing(row,
+                                           owners=batch_owners(user_repo, [row]))}
     if row["status"] != "claimed" or not row.get("claimer_uid"):
         raise HTTPException(422, {"code": "not_claimed",
                                   "message": "Nothing to confirm — listing is not claimed"})
@@ -227,7 +231,8 @@ def confirm_exchange(
     return {
         "status": row["status"],
         "confirmed_by": sorted(confirmed),
-        "listing": public_listing(row),
+        "listing": public_listing(row,
+                                   owners=batch_owners(user_repo, [row])),
     }
 
 
