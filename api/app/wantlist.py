@@ -16,12 +16,17 @@ import uuid
 from typing import Any, Protocol
 
 from fastapi import APIRouter, Depends, HTTPException
+from psycopg import errors as pg_errors
 from pydantic import BaseModel, Field
 
 from .auth import ensure_owner, get_current_uid
 from .cache import cache
 from .db import get_db_conn
 from .notify import NotificationRepo, get_notification_repo, send_notification
+
+
+class WantDuplicateError(Exception):
+    """Raised when a want-list entry duplicates an existing variety."""
 
 router = APIRouter(prefix="/v1/want-list", tags=["want-list"])
 
@@ -108,11 +113,24 @@ class PostgresWantRepo:
         return d
 
     def create(self, data: dict[str, Any]) -> dict[str, Any]:
-        row = self._conn.execute(
-            "INSERT INTO want_list (id, user_uid, variety, types) VALUES (%s,%s,%s,%s) RETURNING *",
-            (data["id"], data["user_uid"], data["variety"], data.get("types") or []),
-        ).fetchone()
-        self._conn.commit()
+        try:
+            row = self._conn.execute(
+                "INSERT INTO want_list (id, user_uid, variety, types) VALUES (%s,%s,%s,%s) RETURNING *",
+                (data["id"], data["user_uid"], data["variety"], data.get("types") or []),
+            ).fetchone()
+            self._conn.commit()
+        except Exception as exc:
+            self._conn.rollback()
+            # Race guard: the endpoint checks for duplicates first, but two
+            # concurrent creates can still collide on the unique index.
+            # Match the structured diag, never the exception text.
+            if (isinstance(exc, pg_errors.UniqueViolation)
+                    and getattr(exc.diag, "constraint_name", None)
+                    == "want_list_user_variety_uidx"):
+                raise WantDuplicateError(
+                    f"duplicate want variety for user {data.get('user_uid')}"
+                ) from exc
+            raise
         return self._row(row)
 
     def list_for_user(self, uid: str) -> list[dict[str, Any]]:
@@ -133,10 +151,20 @@ class PostgresWantRepo:
         if unknown:
             raise ValueError(f"refusing to update unknown want_list columns: {unknown}")
         sets = ", ".join(f"{k} = %s" for k in fields)
-        self._conn.execute(
-            f"UPDATE want_list SET {sets} WHERE id = %s", (*fields.values(), want_id)
-        )
-        self._conn.commit()
+        try:
+            self._conn.execute(
+                f"UPDATE want_list SET {sets} WHERE id = %s", (*fields.values(), want_id)
+            )
+            self._conn.commit()
+        except Exception as exc:
+            self._conn.rollback()
+            if (isinstance(exc, pg_errors.UniqueViolation)
+                    and getattr(exc.diag, "constraint_name", None)
+                    == "want_list_user_variety_uidx"):
+                raise WantDuplicateError(
+                    f"duplicate want variety on update {want_id}"
+                ) from exc
+            raise
         return self.get(want_id)
 
     def delete(self, want_id: str) -> bool:
@@ -294,6 +322,29 @@ def notify_matches(
     return n
 
 
+def _normalize_variety(variety: str) -> str:
+    """Canonical form for duplicate detection: trimmed, case-folded."""
+    return variety.strip().lower()
+
+
+def _duplicate_entry(
+    repo: WantRepo, uid: str, variety: str, exclude_id: str | None = None
+) -> bool:
+    """True if the user already wants this variety (case-insensitive)."""
+    needle = _normalize_variety(variety)
+    return any(
+        e["id"] != exclude_id and _normalize_variety(e.get("variety") or "") == needle
+        for e in repo.list_for_user(uid)
+    )
+
+
+def _duplicate_response() -> HTTPException:
+    return HTTPException(
+        409,
+        {"code": "want_duplicate", "message": "That variety is already in your want list"},
+    )
+
+
 @router.post("", status_code=201)
 def create_want(
     data: WantIn,
@@ -301,12 +352,19 @@ def create_want(
     repo: WantRepo = Depends(get_want_repo),
 ) -> dict[str, Any]:
     _validate_types(data.types)
-    row = repo.create({
-        "id": str(uuid.uuid4()),
-        "user_uid": uid,
-        "variety": data.variety.strip(),
-        "types": data.types,
-    })
+    variety = data.variety.strip()
+    if _duplicate_entry(repo, uid, variety):
+        raise _duplicate_response()
+    try:
+        row = repo.create({
+            "id": str(uuid.uuid4()),
+            "user_uid": uid,
+            "variety": variety,
+            "types": data.types,
+        })
+    except WantDuplicateError:
+        # Lost a concurrent-create race on the unique index.
+        raise _duplicate_response()
     # A new want changes the writer's feed tiers -> drop their ranked pages.
     cache.invalidate_prefix(f"l:live:ranked:{uid}:")
     return _serialize(row)
@@ -335,7 +393,12 @@ def patch_want(
     fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
     if "variety" in fields:
         fields["variety"] = fields["variety"].strip()
-    updated = repo.update(want_id, fields)
+        if _duplicate_entry(repo, uid, fields["variety"], exclude_id=want_id):
+            raise _duplicate_response()
+    try:
+        updated = repo.update(want_id, fields)
+    except WantDuplicateError:
+        raise _duplicate_response()
     # Variety/type edits change the writer's feed tiers.
     cache.invalidate_prefix(f"l:live:ranked:{uid}:")
     return _serialize(updated)

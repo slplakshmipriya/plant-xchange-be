@@ -314,3 +314,50 @@ def test_want_update_rejects_unknown_column():
     with pytest.raises(ValueError, match="unknown want_list columns"):
         PostgresWantRepo(_NoExecConn()).update("w1", {"variety": "x",
                                                       "user_uid": "mallory"})
+
+
+def test_want_create_rejects_duplicate_variety(mem_all, mock_verify, auth_headers):
+    client, _, _, _, _ = mem_all
+    r = client.post("/v1/want-list", json={"variety": "Tomato"}, headers=auth_headers)
+    assert r.status_code == 201, r.text
+
+    # Same case, different case, and surrounding whitespace all collide.
+    for dup in ("Tomato", "TOMATO", "  tomato  "):
+        r = client.post("/v1/want-list", json={"variety": dup}, headers=auth_headers)
+        assert r.status_code == 409, r.text
+        assert r.json()["code"] == "want_duplicate"
+
+    # Only one row was stored.
+    r = client.get("/v1/want-list", headers=auth_headers)
+    assert len(r.json()["items"]) == 1
+
+
+
+def test_want_patch_rejects_duplicate_variety(mem_all, mock_verify, auth_headers):
+    client, _, _, _, _ = mem_all
+    r = client.post("/v1/want-list", json={"variety": "Tomato"}, headers=auth_headers)
+    assert r.status_code == 201
+    r = client.post("/v1/want-list", json={"variety": "Basil"}, headers=auth_headers)
+    wid = r.json()["id"]
+
+    r = client.patch(f"/v1/want-list/{wid}", json={"variety": "  TOMATO "},
+                     headers=auth_headers)
+    assert r.status_code == 409, r.text
+    assert r.json()["code"] == "want_duplicate"
+
+    # Patching to its own current variety is not a duplicate.
+    r = client.patch(f"/v1/want-list/{wid}", json={"variety": "basil"},
+                     headers=auth_headers)
+    assert r.status_code == 200, r.text
+
+
+
+
+def test_want_create_duplicate_is_per_user(mem_all, mock_verify, auth_headers):
+    """The same variety for a *different* user is fine."""
+    client, _, _, _, _ = mem_all
+    r = client.post("/v1/want-list", json={"variety": "Tomato"}, headers=auth_headers)
+    assert r.status_code == 201, r.text
+    other = {"Authorization": "Bearer nophone-token"}
+    r = client.post("/v1/want-list", json={"variety": "TOMATO"}, headers=other)
+    assert r.status_code == 201, r.text
