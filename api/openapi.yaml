@@ -900,11 +900,14 @@ paths:
 
         With ``way`` (API-123): exact ``{"listings": [...]}`` for one Explore
 
-        way-card, ranked freshest-first by expiry ascending (nulls last) —
+        way-card — except ``way=sitting``, which returns sitter profiles under a
 
-        except ``way=sitting``, which returns sitter profiles under a
+        ``{"sitters": [...]}`` key (L4c).
 
-        ``{"sitters": [...]}`` key (L4c).'
+
+        Ranking (both branches): want-list matches first, then newest post,
+
+        then soonest expiry (nulls last).'
       operationId: get_feed_v1_feed_get
       parameters:
       - name: limit

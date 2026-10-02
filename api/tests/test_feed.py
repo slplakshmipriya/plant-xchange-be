@@ -1,9 +1,10 @@
-"""API-021: feed & discovery ranking + cursor pagination."""
+"""Feed ranking: want-list matches first, then newest post, then soonest
+expiry (nulls last); cursor pagination."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from app.feed import score_listing
+from app.feed import _feed_rank_key
 
 
 def _row(**kw):
@@ -22,32 +23,62 @@ def _iso(dt):
     return dt.isoformat()
 
 
-def test_urgency_outranks_recency():
-    """Expires-soon-first: a listing with 1 day left outranks one listed an
-    hour ago with 6 days left."""
+def _entry(variety, user_uid="bob", types=None):
+    return {"user_uid": user_uid, "variety": variety, "types": types or []}
+
+
+def _ranked(rows, entries):
+    return [r["id"] for r in sorted(rows, key=lambda r: _feed_rank_key(r, entries))]
+
+
+def test_want_match_outranks_newer_non_match():
     now = datetime.now(timezone.utc)
-    soon = _row(id="soon", created_at=_iso(now - timedelta(hours=1)),
-                expires_at=_iso(now + timedelta(days=1)))
-    later = _row(id="later", created_at=_iso(now - timedelta(minutes=30)),
-                 expires_at=_iso(now + timedelta(days=6)))
-    assert score_listing(soon, now) > score_listing(later, now)
+    old_match = _row(id="old-match", variety="Cherokee Purple tomato",
+                     created_at=_iso(now - timedelta(days=5)),
+                     expires_at=_iso(now + timedelta(days=10)))
+    new_plain = _row(id="new-plain", variety="basil",
+                     created_at=_iso(now - timedelta(minutes=5)),
+                     expires_at=_iso(now + timedelta(days=1)))
+    entries = [_entry("tomato")]
+    assert _ranked([new_plain, old_match], entries) == ["old-match", "new-plain"]
 
 
-def test_freshness_breaks_urgency_ties():
+def test_newer_post_breaks_non_match_ties():
     now = datetime.now(timezone.utc)
     exp = _iso(now + timedelta(days=3))
     old = _row(id="old", created_at=_iso(now - timedelta(days=2)), expires_at=exp)
     new = _row(id="new", created_at=_iso(now - timedelta(minutes=5)), expires_at=exp)
-    assert score_listing(new, now) > score_listing(old, now)
+    assert _ranked([old, new], []) == ["new", "old"]
 
 
-def test_want_boost_lifts_matching_seedling():
+def test_sooner_expiry_breaks_date_ties():
     now = datetime.now(timezone.utc)
-    exp = _iso(now + timedelta(days=3))
-    plain = _row(id="plain", variety="basil", created_at=_iso(now), expires_at=exp)
-    match = _row(id="match", variety="Cherokee Purple tomato",
-                 created_at=_iso(now), expires_at=exp)
-    assert score_listing(match, now, boost=1.0) > score_listing(plain, now)
+    created = _iso(now - timedelta(hours=1))
+    soon = _row(id="soon", created_at=created,
+                expires_at=_iso(now + timedelta(days=1)))
+    later = _row(id="later", created_at=created,
+                 expires_at=_iso(now + timedelta(days=6)))
+    assert _ranked([later, soon], []) == ["soon", "later"]
+
+
+def test_null_expiry_sorts_last():
+    now = datetime.now(timezone.utc)
+    created = _iso(now - timedelta(hours=1))
+    dated = _row(id="dated", created_at=created,
+                 expires_at=_iso(now + timedelta(days=6)))
+    undated = _row(id="undated", created_at=created, expires_at=None)
+    assert _ranked([undated, dated], []) == ["dated", "undated"]
+
+
+def test_own_listings_never_count_as_matches():
+    # find_matches excludes the caller's own listings from matching.
+    now = datetime.now(timezone.utc)
+    mine = _row(id="mine", owner_uid="bob", variety="tomato",
+                created_at=_iso(now - timedelta(days=5)))
+    theirs = _row(id="theirs", owner_uid="alice", variety="basil",
+                  created_at=_iso(now - timedelta(minutes=5)))
+    entries = [_entry("tomato", user_uid="bob")]
+    assert _ranked([mine, theirs], entries) == ["theirs", "mine"]
 
 
 def test_feed_returns_live_only_with_pagination(mem_listings, mock_verify, auth_headers):
@@ -104,6 +135,7 @@ def _feed_listing(i, now):
     return {"id": f"f{i}", "owner_uid": "alice", "type": "seedling",
             "photos": ["https://x/y.jpg"], "credit_cost": 1,
             "spray_disclosure": "none", "status": "live",
+            "created_at": (now - timedelta(minutes=i)).isoformat(),
             "expires_at": (now + timedelta(days=i + 1)).isoformat()}
 
 
