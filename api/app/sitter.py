@@ -25,12 +25,16 @@ from .auth import get_current_uid
 from .cache import CachedSitterRepo
 from .db import get_db_conn
 from .users import UserRepo, get_user_repo
+from .vertical import get_vertical
 
 router = APIRouter(prefix="/v1", tags=["sitting"])
 
 # Fixed service taxonomy for sitter profiles. The client renders these as
 # selectable chips; free text is rejected so "Services on reauest" typos
 # can't reach the directory. snake_case on the wire, display names client-side.
+# Default of the built-in "garden" vertical — the live taxonomy comes from
+# get_vertical().taxonomy.sitter_services (extend-only: persisted values
+# are never renamed, new verticals declare their own list).
 SITTER_SERVICES = (
     "watering",
     "repotting",
@@ -39,6 +43,10 @@ SITTER_SERVICES = (
     "pest_control",
     "vacation_care",
 )
+
+
+def _services() -> tuple[str, ...]:
+    return tuple(get_vertical().taxonomy.sitter_services)
 
 _REQUEST_TRANSITIONS = {
     "requested": {"accepted", "declined", "cancelled"},
@@ -50,14 +58,15 @@ _REQUEST_TRANSITIONS = {
 
 
 def _clean_services(values: list[str]) -> list[str]:
-    """Strip, dedupe, and validate against the fixed taxonomy. Raises
-    ValueError on anything outside SITTER_SERVICES (surfacing as 422)."""
+    """Strip, dedupe, and validate against the vertical taxonomy. Raises
+    ValueError on anything outside it (surfacing as 422)."""
+    allowed = _services()
     seen: list[str] = []
     for s in values:
         s = s.strip()
-        if s not in SITTER_SERVICES:
+        if s not in allowed:
             raise ValueError(f"unknown service {s!r}; "
-                             f"must be one of {sorted(SITTER_SERVICES)}")
+                             f"must be one of {sorted(allowed)}")
         if s not in seen:
             seen.append(s)
     return seen
@@ -398,7 +407,14 @@ def get_sitter_repo(conn=Depends(get_db_conn)) -> SitterRepo:
 class SitterProfileIn(BaseModel):
     bio: str = Field(default="", max_length=2000)
     experience_years: int = Field(default=0, ge=0, le=60)
-    service_radius_miles: float = Field(default=5, gt=0, le=100)
+    # Default comes from the vertical config (geo.default_radius_miles):
+    # sitters who don't state a radius serve their marketplace's default
+    # area. The model field always carries a concrete value into
+    # upsert_profile, so repo/DB fallbacks (fields.get(..., 5)) never
+    # override it — they only guard raw dict writes that skip this model.
+    service_radius_miles: float = Field(
+        default_factory=lambda: get_vertical().geo.default_radius_miles,
+        gt=0, le=100)
     active: bool = True
     # Optional daily rate. unit 'credits' = whole credits/day (the credit
     # ledger is integer); 'usd' = dollars/day. Both null = "rate on request".

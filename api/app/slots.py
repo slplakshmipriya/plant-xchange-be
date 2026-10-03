@@ -20,7 +20,7 @@ import uuid
 from typing import Any, Protocol
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .auth import ensure_owner, get_current_uid
 from .claims import serialize_spend
@@ -30,6 +30,7 @@ from .listings import ListingRepo, get_listing_repo
 from .moderation import ModerationRepo, get_moderation_repo, get_suspension
 from .txn import atomic
 from .users import UserRepo, get_user_repo
+from .vertical import get_vertical
 
 router = APIRouter(prefix="/v1", tags=["trees"])
 
@@ -222,6 +223,20 @@ class SlotIn(BaseModel):
     maxPickers: int = Field(ge=1)
     creditCost: int = Field(ge=0, le=100)
     cashCents: int | None = Field(default=None, ge=0)
+
+    @field_validator("creditCost", mode="after")
+    @classmethod
+    def _credit_cost_within_vertical(cls, v):
+        # The ceiling is API-enforced only: the slots table's CHECK
+        # (migration 0015) bounds credit_cost >= 0 with NO upper bound,
+        # so this validator (and the static Field(le=100)) is the only
+        # thing keeping slot prices at or under the vertical's ceiling.
+        # The vertical may lower that ceiling but never raise it.
+        max_cost = get_vertical().economy.max_listing_cost
+        if v > max_cost:
+            raise ValueError(
+                f"creditCost must be <= {max_cost} for this marketplace")
+        return v
 
 
 # ---------------------------------------------------------------- routes

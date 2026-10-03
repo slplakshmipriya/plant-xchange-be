@@ -65,9 +65,14 @@ from .config import get_settings
 from .db import get_db_conn
 from .sitter import SitterRepo, get_sitter_repo
 from .users import UserRepo, get_user_repo
+from .vertical import get_vertical
 
 router = APIRouter(prefix="/v1", tags=["payments"])
 
+# DEPRECATED as a source of truth: the built-in "garden" default, kept
+# only for import compatibility. Consumers must read
+# get_vertical().fees.sitter_platform_fee_pct at quote time — never
+# this constant — or a non-garden vertical silently gets garden's 18%.
 PLATFORM_FEE_RATE = Decimal("0.18")
 
 # Statuses of a sitting request for which the owner may create a payment hold.
@@ -94,7 +99,8 @@ def quote_booking(booking: dict[str, Any]) -> dict[str, int]:
         raise ValueError(f"subtotal_cents must be an int, got {subtotal!r}")
     if subtotal < 0:
         raise ValueError(f"subtotal_cents must be >= 0, got {subtotal}")
-    fee = (Decimal(subtotal) * PLATFORM_FEE_RATE).quantize(
+    fee_rate = Decimal(str(get_vertical().fees.sitter_platform_fee_pct)) / 100
+    fee = (Decimal(subtotal) * fee_rate).quantize(
         Decimal("1"), rounding=ROUND_HALF_UP)
     fee_cents = int(fee)
     return {
