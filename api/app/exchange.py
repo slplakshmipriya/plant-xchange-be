@@ -81,11 +81,11 @@ def claim_listing(
     if user_repo.get(uid) is None:
         raise HTTPException(400, {"code": "profile_required",
                                   "message": "Create a profile (POST /v1/users) before claiming"})
-    # H6: the whole-listing claim must enforce the same suspension /
-    # anti-gaming rules as the partial-claim endpoint — otherwise a
-    # no-show-suspended user or a new-account claim-cap violator blocked
-    # on POST /v1/listings/{id}/claims can simply claim here instead.
-    _enforce_claim_eligibility(uid, claim_repo, user_repo, mod_repo)
+    # H6: the whole-listing claim must enforce the same suspension
+    # rules as the partial-claim endpoint — otherwise a no-show-suspended
+    # user blocked on POST /v1/listings/{id}/claims can simply claim
+    # here instead.
+    _enforce_claim_eligibility(uid, claim_repo, mod_repo)
     if credit_repo.balance(uid) < row["credit_cost"]:
         raise HTTPException(422, {"code": "insufficient_credits",
                                   "message": "Not enough credits — give before you claim"})
