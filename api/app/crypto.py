@@ -1,4 +1,4 @@
-"""At-rest field encryption (AES-256-GCM via Fernet).
+"""At-rest field encryption (Fernet: AES-128-CBC + HMAC-SHA256).
 
 Values are encrypted in Python before they reach the store (Postgres or the
 in-memory fakes) and decrypted at the last responsible moment before use —

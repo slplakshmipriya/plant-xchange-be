@@ -360,17 +360,17 @@ def test_whole_claim_blocked_for_suspended_user(mem_exchange):
     client, _, _, _, claim_repo, _ = mem_exchange
     lid = _make_listing(client, cost=2)
     _profile(client, BOB, "Bob")
-    claim_repo.record_no_show("bob")
-    claim_repo.record_no_show("bob")  # 2 strikes -> 30-day suspension
+    claim_repo.record_no_show_report("claim-1", "alice", "bob")
+    claim_repo.record_no_show_report("claim-2", "alice", "bob")  # 2 strikes -> 30-day suspension
     r = client.post(f"/v1/listings/{lid}/claim", headers=BOB)
     assert r.status_code == 403, r.text
     assert r.json()["code"] == "claim_suspended"
     assert "no-show" in r.json()["message"] or "no-shows" in r.json()["message"]
 
 
-def test_whole_claim_blocked_for_new_account_claim_cap(mem_exchange):
-    """H6: a new account that exhausted its rolling claim cap on the
-    partial-claim endpoint cannot dodge it via the whole-listing claim."""
+def test_whole_claim_not_blocked_by_claim_volume(mem_exchange):
+    """Product decision 2026-10-02: no new-account claim cap, so a fresh
+    account with many recent claims can still whole-claim."""
     client, _, _, _, claim_repo, _ = mem_exchange
     lid = _make_listing(client, cost=2)
     _profile(client, BOB, "Bob")
@@ -380,8 +380,7 @@ def test_whole_claim_blocked_for_new_account_claim_cap(mem_exchange):
                            "pickup_start_ms": 1, "pickup_end_ms": 2,
                            "notes": None})
     r = client.post(f"/v1/listings/{lid}/claim", headers=BOB)
-    assert r.status_code == 403, r.text
-    assert r.json()["code"] == "new_account_claim_cap"
+    assert r.status_code == 200, r.text
 
 
 def test_whole_claim_allowed_when_eligible(mem_exchange):

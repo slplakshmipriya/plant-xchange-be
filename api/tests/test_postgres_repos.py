@@ -83,7 +83,7 @@ def listing(pg_conn, users):
     return repo.create({
         "id": str(uuid.uuid4()),
         "owner_uid": "pg-alice",
-        "type": "produce",
+        "type": "harvest",
         "photos": [],
         "credit_cost": 2,
         "spray_disclosure": "none",

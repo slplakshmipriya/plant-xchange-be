@@ -346,28 +346,23 @@ def test_dispute_resolve_unknown_id_404(mem_trust, monkeypatch):
     assert r.status_code == 404, r.text
 
 
-def test_dispute_reversal_cap_blocked_leaves_dispute_open(mem_trust, monkeypatch):
-    # M11: reversals post BEFORE the status flip. If the claimer's earn cap
-    # (credits.py is another track's file — no exemption there) blocks the
-    # reversal, the dispute stays open (409) instead of resolved-but-unreversed.
+def test_dispute_reversal_not_cap_blocked(mem_trust, monkeypatch):
+    # Dispute reversals are refunds (transfers), cap-exempt since the earn
+    # cap started governing issuance only: a claimer at the issuance cap
+    # still gets their credits back and the dispute resolves.
     client, mrepo, _, _, crepo = mem_trust
     monkeypatch.setenv("SUPPORT_UIDS", "alice")
     lid = _completed_exchange(client, cost=2)
-    # bob (claimer) earns 10 in the window -> the 1-credit reversal exceeds the cap.
+    # bob (claimer) is at the 7-day ISSUANCE cap.
     crepo.add_entry("bob", 10, "welcome_bonus", idempotency_key="cap-fill")
     did = client.post("/v1/disputes", headers=BOB,
                       json={"exchangeId": lid, "reason": "wrong-item",
                             "details": "got basil not tomato"}).json()["dispute"]["id"]
     r = _resolve(client, did, {"outcome": "upheld", "reversalCredits": 1}, ALICE)
-    assert r.status_code == 409, r.text
-    assert r.json()["code"] == "dispute_reversal_cap_blocked"
-    # Dispute is still open and no reversal was posted (retryable).
-    assert mrepo.get_dispute(did)["status"] == "open"
-    assert not [e for e in crepo._entries if e["reason"] == "dispute_reversal"]
-    # And it can still be resolved with reversalCredits=0.
-    r = _resolve(client, did, {"outcome": "rejected", "reversalCredits": 0}, ALICE)
     assert r.status_code == 200, r.text
     assert r.json()["dispute"]["status"] == "resolved"
+    reversals = [e for e in crepo.entries("bob") if e["reason"] == "dispute_reversal"]
+    assert len(reversals) == 1 and reversals[0]["delta"] == 1
 
 
 def test_dispute_resolve_race_loser_409(mem_trust, monkeypatch):

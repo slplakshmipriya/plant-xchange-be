@@ -28,6 +28,7 @@ from .credits import CreditRepo, get_credit_repo
 from .db import get_db_conn
 from .listings import ListingRepo, get_listing_repo
 from .moderation import ModerationRepo, get_moderation_repo, get_suspension
+from .txn import atomic
 from .users import UserRepo, get_user_repo
 
 router = APIRouter(prefix="/v1", tags=["trees"])
@@ -219,7 +220,7 @@ class SlotIn(BaseModel):
     startMs: int = Field(ge=0)
     endMs: int = Field(ge=0)
     maxPickers: int = Field(ge=1)
-    creditCost: int = Field(ge=0)
+    creditCost: int = Field(ge=0, le=100)
     cashCents: int | None = Field(default=None, ge=0)
 
 
@@ -326,24 +327,27 @@ def claim_slot(
         if credit_repo.balance(uid) < cost:
             raise HTTPException(422, {"code": "insufficient_credits",
                                       "message": "Not enough credits — give before you claim"})
-        # Atomic claim: the (slot, claimer) record and the claimed_count
-        # increment happen in one transaction. A repeat claim by the same user
-        # raises AlreadyClaimed (409) instead of double-counting a spot that
-        # the idempotent ledger would never charge twice for.
-        try:
-            updated = slot_repo.claim_slot(slot_id, uid)
-        except AlreadyClaimed:
-            raise HTTPException(409, {"code": "already_claimed",
-                                      "message": "You already claimed a spot in this slot"})
-        if updated is None:
-            raise HTTPException(409, {"code": "slot_full",
-                                      "message": "This slot just filled up"})
-        # Credits move through the append-only ledger (same pattern as
-        # exchange.confirm). Idempotency keys include the claimer so each claim
-        # is a distinct spot purchase.
-        base_key = f"slot:{slot_id}:{uid}"
-        credit_repo.add_entry(uid, -cost, "slot_spend", ref_id=slot_id,
-                              idempotency_key=f"{base_key}:spend")
-        credit_repo.add_entry(slot["owner_uid"], cost, "slot_earn", ref_id=slot_id,
-                              idempotency_key=f"{base_key}:earn")
+        # Atomic claim: the (slot, claimer) record, the claimed_count
+        # increment, and both credit legs land in one transaction. A repeat
+        # claim by the same user raises AlreadyClaimed (409) instead of
+        # double-counting a spot that the idempotent ledger would never
+        # charge twice for; a failed earn can no longer leave the spot
+        # consumed and the claimer charged (pre-fix behavior).
+        with atomic(slot_repo, credit_repo):
+            try:
+                updated = slot_repo.claim_slot(slot_id, uid)
+            except AlreadyClaimed:
+                raise HTTPException(409, {"code": "already_claimed",
+                                          "message": "You already claimed a spot in this slot"})
+            if updated is None:
+                raise HTTPException(409, {"code": "slot_full",
+                                          "message": "This slot just filled up"})
+            # Credits move through the append-only ledger (same pattern as
+            # exchange.confirm). Idempotency keys include the claimer so each
+            # claim is a distinct spot purchase.
+            base_key = f"slot:{slot_id}:{uid}"
+            credit_repo.add_entry(uid, -cost, "slot_spend", ref_id=slot_id,
+                                  idempotency_key=f"{base_key}:spend")
+            credit_repo.add_entry(slot["owner_uid"], cost, "slot_earn", ref_id=slot_id,
+                                  idempotency_key=f"{base_key}:earn")
     return {"slot": public_slot(updated)}

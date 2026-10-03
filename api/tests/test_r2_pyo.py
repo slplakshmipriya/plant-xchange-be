@@ -233,6 +233,46 @@ def test_claim_moves_credits_ownerward(mem_slots, mock_verify, auth_headers, mon
     assert "slot_earn" in reasons
 
 
+def test_create_slot_rejects_cost_above_100(mem_slots, mock_verify, auth_headers):
+    """H1: slot creditCost was unbounded (ge=0) — a 10,000-credit slot was
+    creatable. Bounded to the same 1–100 listing band (0 stays: free slots)."""
+    client, urepo, _, _, _, _ = mem_slots
+    urepo.upsert("alice", display_name="Alice")
+    tid = _make_tree(client, auth_headers)
+    r = client.post(f"/v1/trees/{tid}/slots",
+                    json=_slot_payload(creditCost=101), headers=auth_headers)
+    assert r.status_code == 422, r.text
+    r = client.post(f"/v1/trees/{tid}/slots",
+                    json=_slot_payload(creditCost=100), headers=auth_headers)
+    assert r.status_code == 201, r.text
+    r = client.post(f"/v1/trees/{tid}/slots",
+                    json=_slot_payload(creditCost=0), headers=auth_headers)
+    assert r.status_code == 201, r.text
+
+
+def test_claim_high_cost_slot_moves_credits_once(mem_slots, mock_verify,
+                                                auth_headers, monkeypatch):
+    """H1 regression: a 50-credit slot claim pays the owner in full — the
+    slot_earn transfer is exempt from the 7-day issuance cap."""
+    client, urepo, _, _, crepo, _ = mem_slots
+    urepo.upsert("alice", display_name="Alice")
+    urepo.upsert("bob", display_name="Bob")
+    tid = _make_tree(client, auth_headers)
+    r = client.post(f"/v1/trees/{tid}/slots",
+                    json=_slot_payload(creditCost=50, maxPickers=2),
+                    headers=auth_headers)
+    assert r.status_code == 201, r.text
+    slot_id = r.json()["slot"]["id"]
+    crepo.add_entry("bob", 60, "exchange_earn", ref_id="t")  # transfer-funded
+    login_as(monkeypatch, "bob")
+
+    r = client.post(f"/v1/trees/{tid}/slots/{slot_id}/claim", headers=auth_headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["slot"]["claimedCount"] == 1
+    assert crepo.balance("bob") == 10
+    assert crepo.balance("alice") == 50
+
+
 def test_claim_owner_cannot_claim_own_slot(mem_slots, mock_verify, auth_headers):
     client, tid, slot_id, _ = _claim_setup(mem_slots, mock_verify, auth_headers)
 

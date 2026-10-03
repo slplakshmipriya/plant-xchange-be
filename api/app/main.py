@@ -18,7 +18,7 @@ from .auth import (
     get_current_uid,
     init_firebase,
 )
-from .config import get_settings, validate_idv_config
+from .config import get_settings, validate_idv_config, validate_phone_config
 from .db import close_pool, run_migrations
 from .errors import error_response, http_exception_detail
 from .middleware import (
@@ -99,6 +99,9 @@ async def lifespan(app: FastAPI):
     # the explicit ENABLE_IDV_STUB=1 opt-in — a deploy that forgot
     # IDV_PROVIDER must refuse to boot instead of shipping the backdoor.
     validate_idv_config(get_settings())
+    # M2: deployed environments must key the phone hash (HMAC) — the
+    # unsalted legacy SHA-256 is reversible from any DB leak.
+    validate_phone_config(get_settings())
     # H5: refuse to boot when the local storage stub is selected in
     # production — unfinalized originals would be served with GPS EXIF intact.
     storage_module.validate_storage_config(get_settings())

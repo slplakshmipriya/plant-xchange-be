@@ -235,7 +235,8 @@ design: wallet)
 - **API-061** [P0, 5] Issuance, expiry, caps
   - AC: Mint on both-side completion only; 3 starter credits on signup;
     seasonal expiry job (2 seasons/yr, warnings at 30d/7d via push);
-    10 credits/week earning cap; new accounts (<14d): 5 claims/week cap.
+    10 credits/week earning cap; new accounts (<14d): 5 claims/week cap
+    [REMOVED 2026-10-02 — see PRD].
 - **API-062** [P0, 3] Dispute-driven reversal
   - AC: Support tool reverses a credit movement with audit trail; reversal
     itself is a ledger entry (never delete).
@@ -616,7 +617,9 @@ claim-with-quantity, `cancelClaim`, `reportContent`, `Review.reviewerRole` /
   by API-146.
 - **AND-162** [P2, 2] Credit-expiry push client surface. Blocked by API-146.
 - **API-147** [P2, 5] New-account claim caps enforced server-side.
+  [REMOVED 2026-10-02 — rule dropped, see PRD]
 - **AND-164** [P2, 2] New-account claim-cap notice (<14d: 5 claims/week).
+  [VOID 2026-10-02 — rule dropped]
   Blocked by API-147.
 - **API-149** [P0, 13] Stripe Connect platform integration (see also API-130).
 - **API-150** [P1, 5] Seasonal credit-expiry batch job + 30-day warning

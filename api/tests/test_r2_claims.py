@@ -226,11 +226,12 @@ def test_accept_decline_permissions(mem_claims):
 
 def test_no_show_suspension_blocks_claim(mem_claims):
     client, _, _, _, _ = mem_claims
-    lid = _make_listing(client, ALICE)
     _profile(client, BOB, "Bob")
 
-    # bob claims; alice accepts; alice reports bob as a no-show.
-    body = _claim(client, lid, BOB, quantity=3)
+    # Strike 1: bob no-shows on alice's listing (pickup window long past).
+    lid = _make_listing(client, ALICE)
+    body = _claim(client, lid, BOB, quantity=3,
+                  pickupStartMs=1_700_000_000_000, pickupEndMs=1_700_003_600_000)
     r = client.post(f"/v1/listings/{lid}/claims/accept",
                     json={"claimId": body["claim"]["id"]}, headers=ALICE)
     assert r.status_code == 200, r.text
@@ -242,17 +243,70 @@ def test_no_show_suspension_blocks_claim(mem_claims):
     assert r.json()["no_shows"] == 1
     assert r.json()["suspended_until"] is None
 
-    # Second no-show -> 30-day suspension.
-    r = client.post(f"/v1/exchanges/{lid}/no-show",
+    # Strike 2 needs a SECOND claim — re-reporting this one is a 409 (M1).
+    lid2 = _make_listing(client, ALICE)
+    body = _claim(client, lid2, BOB, quantity=3,
+                  pickupStartMs=1_700_000_000_000, pickupEndMs=1_700_003_600_000)
+    r = client.post(f"/v1/listings/{lid2}/claims/accept",
+                    json={"claimId": body["claim"]["id"]}, headers=ALICE)
+    assert r.status_code == 200, r.text
+    r = client.post(f"/v1/exchanges/{lid2}/no-show",
                     json={"side": "claimer"}, headers=ALICE)
     assert r.json()["no_shows"] == 2
     assert r.json()["suspended_until"] is not None
 
     # Bob's next claim is blocked.
-    lid2 = _make_listing(client, ALICE)
-    r = client.post(f"/v1/listings/{lid2}/claims", json=_claim_body(), headers=BOB)
+    lid3 = _make_listing(client, ALICE)
+    r = client.post(f"/v1/listings/{lid3}/claims", json=_claim_body(), headers=BOB)
     assert r.status_code == 403, r.text
     assert r.json()["code"] == "claim_suspended"
+
+
+def test_no_show_report_deduped_per_claim(mem_claims):
+    """M1: one strike per (claim, reporter) — double-posting the same
+    claim used to suspend a counterparty in two calls."""
+    client, _, _, _, claim_repo = mem_claims
+    lid = _make_listing(client, ALICE)
+    _profile(client, BOB, "Bob")
+
+    body = _claim(client, lid, BOB, quantity=3,
+                  pickupStartMs=1_700_000_000_000, pickupEndMs=1_700_003_600_000)
+    r = client.post(f"/v1/listings/{lid}/claims/accept",
+                    json={"claimId": body["claim"]["id"]}, headers=ALICE)
+    assert r.status_code == 200, r.text
+
+    r = client.post(f"/v1/exchanges/{lid}/no-show",
+                    json={"side": "claimer"}, headers=ALICE)
+    assert r.status_code == 200, r.text
+    r = client.post(f"/v1/exchanges/{lid}/no-show",
+                    json={"side": "claimer"}, headers=ALICE)
+    assert r.status_code == 409, r.text
+    assert r.json()["code"] == "no_show_already_reported"
+    assert claim_repo.get_strikes("bob")["no_shows"] == 1
+
+    # And a party cannot report their own side.
+    r = client.post(f"/v1/exchanges/{lid}/no-show",
+                    json={"side": "claimer"}, headers=BOB)
+    assert r.status_code == 422, r.text
+    assert r.json()["code"] == "cannot_report_self"
+
+
+def test_no_show_before_pickup_window_end_rejected(mem_claims):
+    """M1: a no-show cannot be reported before the pickup window ends."""
+    client, _, _, _, _ = mem_claims
+    lid = _make_listing(client, ALICE)
+    _profile(client, BOB, "Bob")
+
+    # Default _claim_body window is in 2027 — still open.
+    body = _claim(client, lid, BOB, quantity=3)
+    r = client.post(f"/v1/listings/{lid}/claims/accept",
+                    json={"claimId": body["claim"]["id"]}, headers=ALICE)
+    assert r.status_code == 200, r.text
+
+    r = client.post(f"/v1/exchanges/{lid}/no-show",
+                    json={"side": "claimer"}, headers=ALICE)
+    assert r.status_code == 422, r.text
+    assert r.json()["code"] == "pickup_window_open"
 
 
 def test_moderation_suspension_blocks_claim(mem_claims):
@@ -278,15 +332,16 @@ def test_moderation_suspension_blocks_claim(mem_claims):
 
 def test_no_show_giver_side_suspends_giver(mem_claims):
     client, _, _, _, _ = mem_claims
-    lid = _make_listing(client, ALICE)
     _profile(client, BOB, "Bob")
 
-    body = _claim(client, lid, BOB, quantity=3)
-    client.post(f"/v1/listings/{lid}/claims/accept",
-                json={"claimId": body["claim"]["id"]}, headers=ALICE)
-
-    # Claimer reports the giver as a no-show, twice.
+    # Claimer reports the giver as a no-show on two distinct claims.
     for _ in range(2):
+        lid = _make_listing(client, ALICE)
+        body = _claim(client, lid, BOB, quantity=3,
+                      pickupStartMs=1_700_000_000_000, pickupEndMs=1_700_003_600_000)
+        r = client.post(f"/v1/listings/{lid}/claims/accept",
+                        json={"claimId": body["claim"]["id"]}, headers=ALICE)
+        assert r.status_code == 200, r.text
         r = client.post(f"/v1/exchanges/{lid}/no-show",
                         json={"side": "giver"}, headers=BOB)
         assert r.status_code == 200, r.text
@@ -311,27 +366,17 @@ def test_no_show_requires_active_claim(mem_claims):
     assert r.json()["code"] == "no_active_claim"
 
 
-def test_new_account_claim_cap(mem_claims):
-    client, urepo, _, _, _ = mem_claims
+def test_new_account_not_claim_capped(mem_claims):
+    """Product decision 2026-10-02: no new-account claim cap — claiming
+    keeps the ecosystem going, so a fresh account may claim freely."""
+    client, _, _, _, _ = mem_claims
     _profile(client, BOB, "Bob")  # fresh account: < 14 days old
 
-    # 5 claims in the rolling 7-day window are fine.
-    for _ in range(5):
+    # Well past the old 5-per-rolling-7-days cap: every claim succeeds.
+    for _ in range(6):
         lid = _make_listing(client, ALICE)
         r = client.post(f"/v1/listings/{lid}/claims", json=_claim_body(), headers=BOB)
         assert r.status_code == 200, r.text
-
-    # The 6th is blocked.
-    lid = _make_listing(client, ALICE)
-    r = client.post(f"/v1/listings/{lid}/claims", json=_claim_body(), headers=BOB)
-    assert r.status_code == 403, r.text
-    assert r.json()["code"] == "new_account_claim_cap"
-
-    # Aged account (> 14 days) is not capped.
-    urepo._rows["bob"]["created_at"] = (
-        datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
-    r = client.post(f"/v1/listings/{lid}/claims", json=_claim_body(), headers=BOB)
-    assert r.status_code == 200, r.text
 
 
 def test_check_pillar_suspension_helper(mem_claims):
@@ -342,9 +387,9 @@ def test_check_pillar_suspension_helper(mem_claims):
     assert claims_mod.check_pillar_suspension("bob", "claims", claim_repo) is None
     assert claims_mod.check_pillar_suspension("bob", "other-pillar", claim_repo) is None
 
-    claim_repo.record_no_show("bob")
+    claim_repo.record_no_show_report("claim-1", "alice", "bob")
     assert claims_mod.check_pillar_suspension("bob", "claims", claim_repo) is None
-    claim_repo.record_no_show("bob")
+    claim_repo.record_no_show_report("claim-2", "alice", "bob")
     suspension = claims_mod.check_pillar_suspension("bob", "claims", claim_repo)
     assert suspension is not None
     assert suspension["pillar"] == "claims"
@@ -402,6 +447,43 @@ def test_claim_lifecycle_money_leg(mem_claims):
     assert len(_claim_entries(crepo, "alice", claim_id)) == 1
     assert crepo.balance("bob") == 2
     assert crepo.balance("alice") == 4
+
+
+def test_accept_high_price_listing_moves_credits_once(mem_claims):
+    """C1 regression (code review 2026-10-02): with prices up to 100
+    (migration 0039) the giver's claim_earn is a transfer and exempt from
+    the 7-day issuance cap — accepting a 20-credit claim must move the
+    credits exactly once, never burn the claimer's spend."""
+    client, _, _, crepo, _ = mem_claims
+    lid = _make_listing(client, ALICE, cost=20)
+    _profile(client, BOB, "Bob")
+    # Bob holds 28 (3 starter + 25 of transfer earnings, all cap-exempt).
+    crepo.add_entry("bob", 25, "exchange_earn", idempotency_key="fund:bob")
+    assert crepo.balance("bob") == 28
+    # Alice is already at the issuance cap for the window: irrelevant here.
+    crepo.add_entry("alice", 10, "welcome_bonus", idempotency_key="fund:alice")
+
+    body = _claim(client, lid, BOB, quantity=3)
+    claim_id = body["claim"]["id"]
+
+    r = client.post(f"/v1/listings/{lid}/claims/accept",
+                    json={"claimId": claim_id}, headers=ALICE)
+    assert r.status_code == 200, r.text
+    assert r.json()["claim"]["status"] == "accepted"
+    spends = [e for e in _claim_entries(crepo, "bob", claim_id)
+              if e["reason"] == "claim_spend"]
+    earns = [e for e in _claim_entries(crepo, "alice", claim_id)
+             if e["reason"] == "claim_earn"]
+    assert len(spends) == 1 and spends[0]["delta"] == -20
+    assert len(earns) == 1 and earns[0]["delta"] == 20
+    assert crepo.balance("bob") == 8
+    assert crepo.balance("alice") == 33  # 3 starter + 10 bonus + 20 earn
+
+    # Cancelling the accepted claim unwinds the full 20, not a partial leg.
+    r = client.post(f"/v1/listings/{lid}/claims/cancel", headers=BOB)
+    assert r.status_code == 200, r.text
+    assert crepo.balance("bob") == 28
+    assert crepo.balance("alice") == 13
 
 
 def test_accept_rechecks_claimer_balance(mem_claims):

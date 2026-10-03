@@ -163,7 +163,10 @@ the paid services layer later.
   - Max 10 credits earned per user per week (tunable).
   - Both-side completion confirmation required; disputed completions freeze
     issuance pending review.
-  - New accounts (< 14 days) capped at 5 claims/week.
+  - New accounts (< 14 days) capped at 5 claims/week. **Removed
+    2026-10-02 (product decision):** no new-account claim cap — claiming
+    is what keeps the swap ecosystem going, so new accounts are
+    encouraged to claim freely. Server enforcement (API-147) removed.
   - Device fingerprinting removed — the `X-Device-Fingerprint` header is no
     longer collected (privacy review M17); phone verification at signup.
 - **Negative balances:** not allowed. If a user has 0 credits, they must give
