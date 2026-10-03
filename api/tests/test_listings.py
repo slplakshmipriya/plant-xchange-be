@@ -636,7 +636,7 @@ def test_public_listing_claimer_uid_owner_claimer_only():
     row = _claimed_row()
     # viewer_uid=None = participant/internal context (claim/exchange routes,
     # where the viewer is always owner or claimer): revealed.
-    assert public_listing(row)["claimer_uid"] == "bob"
+    assert public_listing(row, viewer_uid=None)["claimer_uid"] == "bob"
     assert public_listing(row, viewer_uid="mallory")["claimer_uid"] is None  # third party
     assert public_listing(row, viewer_uid="alice")["claimer_uid"] == "bob"  # owner
     assert public_listing(row, viewer_uid="bob")["claimer_uid"] == "bob"  # claimer

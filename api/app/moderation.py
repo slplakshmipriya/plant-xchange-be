@@ -694,10 +694,11 @@ def resolve_dispute(
         listing = listing_repo.get(dispute["exchange_id"])
         if listing is not None:
             # Reverse credit flow: claimer gets credits back, giver is
-            # debited. Posted BEFORE the status flip (M11). Earn cap handled
-            # explicitly: credits.py is another track's file, so
-            # dispute_reversal cannot be exempted there — a capped claimer
-            # gets a 409 and the dispute stays open for retry.
+            # debited. Posted BEFORE the status flip (M11). The legs are
+            # ``dispute_reversal`` — a refund, cap-exempt since the earn
+            # cap started governing issuance only (code_review_fixes) — so
+            # the EarnCapExceededError branch below is defense-in-depth and
+            # no longer reachable through these legs.
             claimer = listing.get("claimer_uid")
             owner = listing.get("owner_uid")
             try:
