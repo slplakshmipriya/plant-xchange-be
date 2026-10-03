@@ -24,7 +24,9 @@ records and a pending/accepted/declined lifecycle:
 - ``POST /v1/exchanges/{id}/no-show`` — record a no-show on one side
   (claimer|giver) of an exchange. 2 no-shows -> 30-day claim suspension,
   enforced on the claim endpoint (403).
-- New accounts (< 14 days old) are capped at 5 claims per rolling 7 days.
+- New accounts: no claim cap. (A <14d / 5-per-7d cap shipped with the
+  r2-claims track; removed 2026-10-02 by product decision — claiming is
+  what keeps the ecosystem going. See the PRD anti-gaming note.)
 
 Suspension lookup lives in the module-local ``check_pillar_suspension()``
 helper — deliberately NOT in ``app/moderation.py`` (owned by another track,
@@ -60,9 +62,6 @@ CLAIM_CATEGORY = "claim"
 # Pillar suspension policy for the claims pillar.
 NO_SHOW_SUSPENSION_THRESHOLD = 2
 NO_SHOW_SUSPENSION_DAYS = 30
-NEW_ACCOUNT_AGE_DAYS = 14
-NEW_ACCOUNT_CLAIM_CAP = 5
-NEW_ACCOUNT_CLAIM_WINDOW_DAYS = 7
 
 # Tolerance for float dust in quantity comparisons (M5b): remaining_qty is
 # NUMERIC on the Postgres path but the decrement binds a Python float, so
@@ -81,9 +80,6 @@ class ClaimRepo(Protocol):
         ...
     def latest_active_for_listing(self, listing_id: str) -> dict[str, Any] | None:
         """Newest pending/accepted claim on this listing (any claimer)."""
-        ...
-    def count_recent_claims(self, claimer_uid: str, since: datetime) -> int:
-        """Claims created by this claimer at or after ``since``."""
         ...
     def record_no_show_report(self, claim_id: str, reporter_uid: str,
                               target_uid: str) -> dict[str, Any] | None:
@@ -165,13 +161,6 @@ class PostgresClaimRepo:
             (listing_id,),
         ).fetchone()
         return self._row(row) if row else None
-
-    def count_recent_claims(self, claimer_uid: str, since: datetime) -> int:
-        row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM claims WHERE claimer_uid = %s AND created_at >= %s",
-            (claimer_uid, since),
-        ).fetchone()
-        return int(row["n"])
 
     def record_no_show_report(self, claim_id: str, reporter_uid: str,
                               target_uid: str) -> dict[str, Any] | None:
@@ -256,18 +245,6 @@ class MemoryClaimRepo:
                  if c["listing_id"] == listing_id and c["status"] in ("pending", "accepted")]
         cands.sort(key=lambda c: c["created_at"], reverse=True)
         return dict(cands[0]) if cands else None
-
-    def count_recent_claims(self, claimer_uid: str, since: datetime) -> int:
-        n = 0
-        for c in self._claims.values():
-            if c["claimer_uid"] != claimer_uid:
-                continue
-            created = c.get("created_at")
-            created_dt = (datetime.fromisoformat(created) if isinstance(created, str)
-                          else created)
-            if created_dt is not None and created_dt >= since:
-                n += 1
-        return n
 
     def record_no_show_report(self, claim_id: str, reporter_uid: str,
                               target_uid: str) -> dict[str, Any] | None:
@@ -399,11 +376,11 @@ def _suspension_error(suspension: dict[str, Any]) -> HTTPException:
 
 
 def _enforce_claim_eligibility(
-    uid: str, claim_repo: ClaimRepo, user_repo: UserRepo, mod_repo: ModerationRepo
+    uid: str, claim_repo: ClaimRepo, mod_repo: ModerationRepo
 ) -> None:
     """403 when the caller is pillar-suspended/banned (no-show strikes or
-    moderation strikes), or when a new account has exhausted its rolling
-    claim cap."""
+    moderation strikes). New accounts are deliberately NOT claim-capped
+    (cap removed 2026-10-02; see module docstring)."""
     suspension = check_pillar_suspension(uid, "claims", claim_repo)
     if suspension is not None:
         raise _suspension_error(suspension)
@@ -414,18 +391,6 @@ def _enforce_claim_eligibility(
             detail={"code": "claim_suspended",
                     "message": f"Claiming suspended ({mod_susp['type']}): {mod_susp['reason']}"},
         )
-    user = user_repo.get(uid)
-    created = _parse_dt(user.get("created_at")) if user else None
-    if created is not None and utcnow() - created < timedelta(days=NEW_ACCOUNT_AGE_DAYS):
-        since = utcnow() - timedelta(days=NEW_ACCOUNT_CLAIM_WINDOW_DAYS)
-        if claim_repo.count_recent_claims(uid, since) >= NEW_ACCOUNT_CLAIM_CAP:
-            raise HTTPException(
-                status_code=403,
-                detail={"code": "new_account_claim_cap",
-                        "message": (f"Accounts under {NEW_ACCOUNT_AGE_DAYS} days old are "
-                                    f"capped at {NEW_ACCOUNT_CLAIM_CAP} claims per "
-                                    f"{NEW_ACCOUNT_CLAIM_WINDOW_DAYS} days")},
-            )
 
 
 # ---------------------------------------------------------------- API models
@@ -492,7 +457,7 @@ def create_claim(
     if user_repo.get(uid) is None:
         raise HTTPException(400, {"code": "profile_required",
                                   "message": "Create a profile (POST /v1/users) before claiming"})
-    _enforce_claim_eligibility(uid, claim_repo, user_repo, mod_repo)
+    _enforce_claim_eligibility(uid, claim_repo, mod_repo)
     if credit_repo.balance(uid) < row["credit_cost"]:
         raise HTTPException(422, {"code": "insufficient_credits",
                                   "message": "Not enough credits — give before you claim"})

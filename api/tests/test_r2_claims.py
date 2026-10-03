@@ -366,27 +366,17 @@ def test_no_show_requires_active_claim(mem_claims):
     assert r.json()["code"] == "no_active_claim"
 
 
-def test_new_account_claim_cap(mem_claims):
-    client, urepo, _, _, _ = mem_claims
+def test_new_account_not_claim_capped(mem_claims):
+    """Product decision 2026-10-02: no new-account claim cap — claiming
+    keeps the ecosystem going, so a fresh account may claim freely."""
+    client, _, _, _, _ = mem_claims
     _profile(client, BOB, "Bob")  # fresh account: < 14 days old
 
-    # 5 claims in the rolling 7-day window are fine.
-    for _ in range(5):
+    # Well past the old 5-per-rolling-7-days cap: every claim succeeds.
+    for _ in range(6):
         lid = _make_listing(client, ALICE)
         r = client.post(f"/v1/listings/{lid}/claims", json=_claim_body(), headers=BOB)
         assert r.status_code == 200, r.text
-
-    # The 6th is blocked.
-    lid = _make_listing(client, ALICE)
-    r = client.post(f"/v1/listings/{lid}/claims", json=_claim_body(), headers=BOB)
-    assert r.status_code == 403, r.text
-    assert r.json()["code"] == "new_account_claim_cap"
-
-    # Aged account (> 14 days) is not capped.
-    urepo._rows["bob"]["created_at"] = (
-        datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
-    r = client.post(f"/v1/listings/{lid}/claims", json=_claim_body(), headers=BOB)
-    assert r.status_code == 200, r.text
 
 
 def test_check_pillar_suspension_helper(mem_claims):
