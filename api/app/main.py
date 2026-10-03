@@ -19,6 +19,7 @@ from .auth import (
     init_firebase,
 )
 from .config import get_settings, validate_idv_config, validate_phone_config
+from .vertical import get_vertical
 from .db import close_pool, run_migrations
 from .errors import error_response, http_exception_detail
 from .middleware import (
@@ -44,6 +45,7 @@ from . import msg as msg_module
 from . import slots as slots_module
 from . import payments as payments_module
 from . import moderation as moderation_module
+from . import vertical_api as vertical_api_module
 
 API_DIR = Path(__file__).resolve().parent.parent
 OPENAPI_PATH = API_DIR / "openapi.yaml"
@@ -108,6 +110,9 @@ async def lifespan(app: FastAPI):
     # M14: loud (non-fatal) warning at boot when USER_TZ is invalid; the
     # quiet-hours check falls back to UTC at runtime.
     notify_module.validate_user_tz(get_settings())
+    # Configurable verticals: fail boot loudly on a malformed config or
+    # unknown VERTICAL_ID instead of silently serving the wrong marketplace.
+    get_vertical()
     # Apply pending DB migrations on startup. Skips gracefully when
     # DATABASE_URL is unset (e.g. local dev / CI without Postgres).
     await _run_migrations_with_retry()
@@ -192,6 +197,7 @@ def create_app() -> FastAPI:
     app.include_router(slots_module.router)
     app.include_router(payments_module.router)
     app.include_router(moderation_module.router)
+    app.include_router(vertical_api_module.router)
 
     @app.get("/me", tags=["auth"])
     def me(uid: str = Depends(get_current_uid)) -> dict:

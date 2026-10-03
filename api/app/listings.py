@@ -62,6 +62,7 @@ from .notify import (
     send_notification,
 )
 from .users import UserRepo, get_user_repo
+from .vertical import get_vertical
 from .wantlist import WantRepo, find_matches, get_want_repo, match_tier, notify_matches
 
 router = APIRouter(prefix="/v1", tags=["listings"])
@@ -799,6 +800,17 @@ class ListingIn(BaseModel):
     def _utc_expires(cls, v):
         return _coerce_utc(v)
 
+    @field_validator("credit_cost", mode="after")
+    @classmethod
+    def _credit_cost_within_vertical(cls, v):
+        # The static Field(le=100) mirrors the DB CHECK ceiling; the
+        # vertical may lower the price ceiling but never raise it.
+        max_cost = get_vertical().economy.max_listing_cost
+        if v is not None and v > max_cost:
+            raise ValueError(
+                f"credit_cost must be <= {max_cost} for this marketplace")
+        return v
+
 
 class ListingPatch(BaseModel):
     photos: list[str] | None = Field(default=None, min_length=1)
@@ -820,6 +832,15 @@ class ListingPatch(BaseModel):
     @classmethod
     def _utc_expires(cls, v):
         return _coerce_utc(v)
+
+    @field_validator("credit_cost", mode="after")
+    @classmethod
+    def _credit_cost_within_vertical(cls, v):
+        max_cost = get_vertical().economy.max_listing_cost
+        if v is not None and v > max_cost:
+            raise ValueError(
+                f"credit_cost must be <= {max_cost} for this marketplace")
+        return v
 
 
 # L1a: column whitelist for PostgresListingRepo.update — mirrors the fixed
