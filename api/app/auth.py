@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 EXEMPT_PATHS = {
     "/healthz",
     "/openapi.yaml",
+    "/v1/config",
     # Webhooks / internal jobs cannot carry a user ID token; they use their
     # own auth (HMAC signature / shared secret) and are exempt here.
     "/v1/idv/webhook",

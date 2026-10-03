@@ -54,11 +54,19 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from .auth import get_current_uid
 from .db import get_db_conn
+from .vertical import get_vertical
 
+# DEPRECATED as a source of truth: these are the built-in "garden"
+# defaults (vertical.py GARDEN_DEFAULT) kept only so existing imports
+# keep working. Consumers must read get_vertical().economy — never
+# these constants — or a non-garden vertical silently gets garden tuning.
 STARTER_CREDITS = 3
 
 # Anti-gaming: max credits of new issuance per rolling window (transfers
 # between users are exempt — see TRANSFER_REASONS).
+# DEPRECATED as a source of truth (garden defaults, import compat only):
+# consumers must read get_vertical().economy.earn_cap_* — see the note
+# on STARTER_CREDITS above.
 EARN_CAP_PER_7D = 10
 EARN_CAP_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 
@@ -195,23 +203,29 @@ class EarnCapExceededError(HTTPException):
     """409: rolling 7-day earn cap hit. Raised by the issuance choke point;
     the app's HTTPException handler renders the standard error envelope."""
 
-    def __init__(self, earned: int, cap: int = EARN_CAP_PER_7D):
+    def __init__(self, earned: int, cap: int | None = None):
+        economy = get_vertical().economy
+        if cap is None:
+            cap = economy.earn_cap_amount
+        days = economy.earn_cap_window_days
         super().__init__(
             status_code=409,
             detail={
                 "code": "earn_cap_exceeded",
                 "message": (
-                    f"Earn cap reached: {earned}/{cap} credits earned in the "
-                    "last 7 days"
+                    f"Earn cap reached: {earned}/{cap} "
+                    f"{economy.credit_name}s earned in the last {days} days"
                 ),
             },
         )
 
 
 def _earned_in_window(entries: list[dict[str, Any]], now_ms: int,
-                      window_ms: int = EARN_CAP_WINDOW_MS) -> int:
+                      window_ms: int | None = None) -> int:
     """Credits ISSUED inside the rolling window. The starter bootstrap,
     spends, and transfers between users do not count."""
+    if window_ms is None:
+        window_ms = get_vertical().economy.earn_cap_window_days * 86_400_000
     cutoff = now_ms - window_ms
     total = 0
     for e in entries:
@@ -232,7 +246,7 @@ def _check_earn_cap(uid: str, delta: int, reason: str,
     if delta <= 0 or reason in ("starter", *TRANSFER_REASONS):
         return
     earned = _earned_in_window(credit_repo.entries(uid), now_ms)
-    if earned + delta > EARN_CAP_PER_7D:
+    if earned + delta > get_vertical().economy.earn_cap_amount:
         raise EarnCapExceededError(earned)
 
 
@@ -399,7 +413,7 @@ def ensure_starter_credits(uid: str, credit_repo: CreditRepo) -> None:
     """
     if not any(e["reason"] == "starter" for e in credit_repo.entries(uid)):
         credit_repo.add_entry(
-            uid, STARTER_CREDITS, "starter", ref_id=uid,
+            uid, get_vertical().economy.starter_credits, "starter", ref_id=uid,
             idempotency_key=f"starter:{uid}",
         )
 
