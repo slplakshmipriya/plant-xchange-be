@@ -2480,6 +2480,21 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - bearerAuth: []
+  /v1/config:
+    get:
+      tags:
+      - config
+      summary: Get Config
+      operationId: get_config_v1_config_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+                title: Response Get Config V1 Config Get
   /me:
     get:
       tags:
@@ -3093,7 +3108,6 @@ components:
           maximum: 100.0
           exclusiveMinimum: 0.0
           title: Service Radius Miles
-          default: 5
         active:
           type: boolean
           title: Active
