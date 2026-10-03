@@ -40,6 +40,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import uuid
 from typing import Any, Protocol
 
@@ -68,6 +69,9 @@ from .storage import (
     _check_key_format,
     get_storage,
 )
+from .text_moderation import BLOCK_CATEGORIES, TextModerator, get_text_moderator
+
+logger = logging.getLogger(__name__)
 from .images import (
     StoredImagesRepo,
     get_blob_store_or_none,
@@ -510,6 +514,7 @@ def send_message(
     uid: str = Depends(get_current_uid),
     repo: MessageRepo = Depends(get_message_repo),
     listing_repo: ListingRepo = Depends(get_listing_repo),
+    moderator: TextModerator = Depends(get_text_moderator),
 ) -> dict[str, Any]:
     """Send a message. Participants only."""
     thread = repo.get_thread(thread_id)
@@ -528,6 +533,19 @@ def send_message(
         raise HTTPException(422, {"code": "message_too_long",
                                   "message": f"Message body exceeds {MAX_MESSAGE_BYTES} bytes "
                                              "(multibyte characters count toward the limit)"})
+    # Pre-publish moderation: score the plaintext BEFORE insert — a blocked
+    # message never reaches the DB, the at-rest encryption, the read cache,
+    # or push. Scores are logged for threshold tuning; the body never is.
+    verdict = moderator.moderate(body)
+    if verdict.blocked:
+        logger.info(
+            "message blocked by moderation (source=%s): %s",
+            verdict.source,
+            {cat: round(score, 3) for cat, score in verdict.scores.items()
+             if cat in BLOCK_CATEGORIES})
+        raise HTTPException(422, {"code": "message_inappropriate",
+                                  "message": "Inappropriate message detected — "
+                                             "it won't be posted"})
     return _serialize_message(repo.add_message(thread_id, uid, body))
 
 
