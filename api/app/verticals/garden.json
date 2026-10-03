@@ -1,0 +1,55 @@
+{
+  "brand": {
+    "display_name": "Garden Swap",
+    "nouns": {
+      "credit": "credit",
+      "offer": "listing",
+      "offer_plural": "listings",
+      "provider": "sitter",
+      "seeker": "claimer"
+    }
+  },
+  "config_version": 1,
+  "economy": {
+    "credit_expiry": "seasonal",
+    "credit_name": "credit",
+    "earn_cap_amount": 10,
+    "earn_cap_window_days": 7,
+    "max_listing_cost": 100,
+    "starter_credits": 3
+  },
+  "fees": {
+    "sitter_platform_fee_pct": 18
+  },
+  "geo": {
+    "default_radius_miles": 5
+  },
+  "modules": {
+    "bookings": true,
+    "chat": true,
+    "listings": true,
+    "sitters": true,
+    "trees": true,
+    "wallet": true,
+    "want_list": true
+  },
+  "taxonomy": {
+    "listing_types": [
+      "seedling",
+      "harvest",
+      "tree"
+    ],
+    "sitter_services": [
+      "watering",
+      "repotting",
+      "fertilizing",
+      "pruning",
+      "pest_control",
+      "vacation_care"
+    ]
+  },
+  "trust": {
+    "idv_required_actions": []
+  },
+  "vertical_id": "garden"
+}

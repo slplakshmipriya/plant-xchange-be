@@ -1,0 +1,51 @@
+{
+  "brand": {
+    "display_name": "ToolShare",
+    "nouns": {
+      "credit": "token",
+      "offer": "tool",
+      "offer_plural": "tools",
+      "provider": "lender",
+      "seeker": "borrower"
+    }
+  },
+  "config_version": 1,
+  "economy": {
+    "credit_expiry": "seasonal",
+    "credit_name": "token",
+    "earn_cap_amount": 10,
+    "earn_cap_window_days": 7,
+    "max_listing_cost": 50,
+    "starter_credits": 5
+  },
+  "fees": {
+    "sitter_platform_fee_pct": 10
+  },
+  "geo": {
+    "default_radius_miles": 10
+  },
+  "modules": {
+    "bookings": false,
+    "chat": true,
+    "listings": true,
+    "sitters": true,
+    "trees": false,
+    "wallet": true,
+    "want_list": true
+  },
+  "taxonomy": {
+    "listing_types": [
+      "seedling",
+      "harvest",
+      "tree"
+    ],
+    "sitter_services": [
+      "lending",
+      "repair"
+    ]
+  },
+  "trust": {
+    "idv_required_actions": []
+  },
+  "vertical_id": "toolshare"
+}
