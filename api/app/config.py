@@ -41,6 +41,9 @@ class Settings:
     payment_provider: str          # PAYMENT_PROVIDER: "stub" (dev) or "stripe"
     stripe_secret_key: str | None  # STRIPE_SECRET_KEY: platform secret key (sk_...)
     stripe_webhook_secret: str | None  # STRIPE_WEBHOOK_SECRET: whsec_... for webhooks
+    # --- Phone hashing (M2) ---
+    environment: str               # ENVIRONMENT: "local" (dev default), "staging", "production"
+    phone_hash_secret: str | None  # PHONE_HASH_SECRET: HMAC key for phone_hash()
 
 
 def get_settings() -> Settings:
@@ -63,6 +66,8 @@ def get_settings() -> Settings:
         payment_provider=os.environ.get("PAYMENT_PROVIDER", "stub"),
         stripe_secret_key=os.environ.get("STRIPE_SECRET_KEY"),
         stripe_webhook_secret=os.environ.get("STRIPE_WEBHOOK_SECRET"),
+        environment=os.environ.get("ENVIRONMENT", "local"),
+        phone_hash_secret=os.environ.get("PHONE_HASH_SECRET"),
     )
 
 
@@ -82,4 +87,22 @@ def validate_idv_config(settings: Settings) -> None:
             "IDV stub provider selected without ENABLE_IDV_STUB=1. "
             "Set IDV_PROVIDER to a real vendor (and IDV_WEBHOOK_SECRET), "
             "or set ENABLE_IDV_STUB=1 for local dev/test only."
+        )
+
+
+def validate_phone_config(settings: Settings) -> None:
+    """Fail-closed phone-hash check (M2).
+
+    Without ``PHONE_HASH_SECRET`` the phone hash falls back to the legacy
+    unsalted SHA-256, which is reversible from any DB leak (phone numbers
+    have ~1e10 possibilities). Deployed environments must set the secret;
+    local dev/test keep the legacy fallback so existing rows still verify
+    (verify.py dual-reads and upgrades rows lazily)."""
+    if settings.environment in ("staging", "production", "prod") \
+            and not settings.phone_hash_secret:
+        raise RuntimeError(
+            "PHONE_HASH_SECRET is not set. Phone numbers would be stored "
+            "as unsalted SHA-256 (reversible from a DB leak). Set "
+            "PHONE_HASH_SECRET (e.g. from Secret Manager) for "
+            "staging/production, or run with ENVIRONMENT=local for dev."
         )

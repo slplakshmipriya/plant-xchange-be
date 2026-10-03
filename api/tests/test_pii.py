@@ -109,7 +109,7 @@ def test_listing_serializer_fuzzes_geo_and_leaks_nothing():
     row = dict(SENSITIVE_LISTING_ROW)
     row["geo_lat"] = encrypt_float(row["geo_lat"], GEO_KEY_ENV)
     row["geo_lon"] = encrypt_float(row["geo_lon"], GEO_KEY_ENV)
-    out = public_listing(row, rng=random.Random(7))
+    out = public_listing(row, rng=random.Random(7), viewer_uid=None)
     leaks = _find_leaks(out, FORBIDDEN_KEYS, _sensitive_values())
     assert leaks == [], leaks
     # exact coordinates must never be returned

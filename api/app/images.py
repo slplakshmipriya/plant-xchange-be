@@ -173,17 +173,20 @@ class PostgresStoredImagesRepo:
         return dict(rows[0]) if rows else None
 
     def release(self, gcs_key):
-        row = self.get_by_gcs_key(gcs_key)
-        if row is None:
+        # Single-statement decrement (L3): the old read-compute-write lost
+        # decrements under concurrent releases. The row lock makes the
+        # decrement atomic; delete-at-zero happens on the decremented value.
+        rows = self._conn.execute(
+            "UPDATE stored_images "
+            "SET refcount = GREATEST(refcount - 1, 0) "
+            "WHERE gcs_key = %s RETURNING refcount", (gcs_key,)).fetchall()
+        if not rows:
+            self._conn.commit()
             return None
-        new_ref = max(0, row["refcount"] - 1)
+        new_ref = int(rows[0]["refcount"])
         if new_ref == 0:
             self._conn.execute(
                 "DELETE FROM stored_images WHERE gcs_key = %s", (gcs_key,))
-        else:
-            self._conn.execute(
-                "UPDATE stored_images SET refcount = %s WHERE gcs_key = %s",
-                (new_ref, gcs_key))
         self._conn.commit()
         return new_ref
 

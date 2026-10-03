@@ -94,7 +94,7 @@ def test_none_geo_round_trips(mem_geo):
     client, _, lrepo = mem_geo
     lid = _create_listing(client, geo_lat=None, geo_lon=None)
     assert lrepo._rows[lid]["geo_lat"] is None
-    out = public_listing(lrepo._rows[lid])
+    out = public_listing(lrepo._rows[lid], viewer_uid=None)
     assert out["geo_lat"] is None and out["geo_lon"] is None
 
 
@@ -110,7 +110,7 @@ def test_update_path_encrypts(mem_geo):
     stored = lrepo._rows[lid]["geo_lat"]
     assert isinstance(stored, str) and stored != "34.0"
     assert decrypt_float(stored, GEO_KEY_ENV) == pytest.approx(34.0)
-    assert public_listing(lrepo._rows[lid])["geo_lat"] != 34.0  # served fuzzed
+    assert public_listing(lrepo._rows[lid], viewer_uid=None)["geo_lat"] != 34.0  # served fuzzed
 
 
 def test_tampered_geo_raises():

@@ -19,8 +19,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -38,48 +37,10 @@ from .images import (
 )
 from .listings import ListingRepo, batch_owners, can_transition, get_listing_repo, public_listing
 from .moderation import ModerationRepo, get_moderation_repo
+from .txn import atomic as _atomic
 from .users import UserRepo, get_user_repo
 
 router = APIRouter(prefix="/v1", tags=["credits"])
-
-
-@contextmanager
-def _atomic(*repos) -> Iterator[None]:
-    """Collapse the repos' per-op commits into a single DB transaction.
-
-    The Postgres repos share the request-scoped psycopg connection but each
-    method commits on its own, so spend/earn/flip would land as three
-    separate commits. While the block runs, their commits are suspended and
-    one commit lands at exit (rollback on error), making the three legs
-    atomic. Memory repos expose no connection and are untouched — there the
-    idempotent entry keys plus the resume path in ``confirm_exchange`` keep
-    retries correct on a best-effort basis.
-    """
-    conns = []
-    for r in repos:
-        c = getattr(r, "_conn", None)
-        if c is not None and all(c is not other for other in conns):
-            conns.append(c)
-    originals = [c.commit for c in conns]
-    try:
-        for c in conns:
-            c.commit = lambda: None
-        yield
-    except BaseException:
-        for c, orig in zip(conns, originals):
-            c.commit = orig
-            try:
-                c.rollback()
-            except Exception:
-                pass
-        raise
-    else:
-        for c, orig in zip(conns, originals):
-            c.commit = orig
-            orig()
-    finally:
-        for c, orig in zip(conns, originals):
-            c.commit = orig
 
 
 def _serialize_entry(row: dict[str, Any]) -> dict[str, Any]:
@@ -133,7 +94,7 @@ def claim_listing(
     if updated is None:
         raise HTTPException(422, {"code": "listing_not_live",
                                   "message": "Someone just claimed this listing"})
-    return public_listing(updated,
+    return public_listing(updated, viewer_uid=None,
                           owners=batch_owners(user_repo, [updated]))
 
 
@@ -163,7 +124,7 @@ def confirm_exchange(
         if fully_done or (spend is not None and row0 is None):
             owners0 = batch_owners(user_repo, [row0]) if row0 else {}
             return {"status": "already_confirmed",
-                    "listing": public_listing(row0, owners=owners0) if row0 else None}
+                    "listing": public_listing(row0, viewer_uid=None, owners=owners0) if row0 else None}
     row = repo.get(data.listing_id)
     if row is None:
         raise HTTPException(404, {"code": "listing_not_found", "message": "No such listing"})
@@ -171,7 +132,7 @@ def confirm_exchange(
         # Repeat confirm after completion: safe no-op, not an error.
         return {"status": "completed",
                 "confirmed_by": sorted(credit_repo.confirmations(data.listing_id)),
-                "listing": public_listing(row,
+                "listing": public_listing(row, viewer_uid=None,
                                            owners=batch_owners(user_repo, [row]))}
     if row["status"] != "claimed" or not row.get("claimer_uid"):
         raise HTTPException(422, {"code": "not_claimed",
@@ -231,7 +192,7 @@ def confirm_exchange(
     return {
         "status": row["status"],
         "confirmed_by": sorted(confirmed),
-        "listing": public_listing(row,
+        "listing": public_listing(row, viewer_uid=None,
                                    owners=batch_owners(user_repo, [row])),
     }
 
