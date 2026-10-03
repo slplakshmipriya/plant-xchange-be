@@ -223,9 +223,22 @@ class GCSBlobStore(Protocol):
     def sign_put_url(self, key: str, content_type: str, expires_seconds: int) -> str:
         """Mint a signed URL the client PUTs raw bytes to.
 
-        ``content_type`` is advisory only — the URL does not constrain the
-        PUT's Content-Type header, so existing clients need no change.
+        ``content_type`` is not bound by the URL (finalize re-detects the
+        real type), but the live GCS implementation binds
+        ``x-goog-content-length-range`` to the image cap — clients must
+        echo that header (see ``GCSStorage.sign_upload``'s ``max_bytes``).
         """
+
+
+def own_photo_url_prefix() -> str | None:
+    """URL prefix of first-party (pipeline-uploaded) photos, or ``None``
+    when the local stub is live. With GCS, listing photos and avatars must
+    live under this prefix (L2) — an arbitrary external URL would bypass
+    EXIF stripping, dedupe, quota, and media GC entirely."""
+    settings = get_settings()
+    if settings.storage_backend == "gcs" and settings.gcs_bucket:
+        return f"https://storage.googleapis.com/{settings.gcs_bucket}/"
+    return None
 
 
 class _LiveGCSBlobStore:
@@ -269,14 +282,16 @@ class _LiveGCSBlobStore:
     def sign_put_url(self, key: str, content_type: str, expires_seconds: int) -> str:
         from datetime import timedelta
 
-        # No content_type constraint on the URL: the client PUTs whatever it
-        # declared at sign time, and finalize re-uploads with the detected
-        # type anyway. Constraining it would 403 clients that don't echo the
-        # exact header.
+        # The URL binds x-goog-content-length-range to the image cap (L1):
+        # a client cannot PUT an oversized blob to the temp key (which
+        # finalize would then download whole). Because the header is part
+        # of the signature, the client must echo it verbatim on the PUT —
+        # the sign response carries it as ``max_bytes`` for that purpose.
         return self._bucket.blob(key).generate_signed_url(
             version="v4",
             expiration=timedelta(seconds=expires_seconds),
             method="PUT",
+            headers={"x-goog-content-length-range": f"0,{MAX_IMAGE_BYTES}"},
         )
 
 
@@ -330,6 +345,9 @@ class GCSStorage:
             "upload_url": upload_url,
             "key": key,
             "public_url": f"https://storage.googleapis.com/{self.bucket}/{key}",
+            # Echo as `x-goog-content-length-range: 0,<max_bytes>` on the
+            # PUT — the signed URL binds that header (see sign_put_url).
+            "max_bytes": MAX_IMAGE_BYTES,
         }
 
     def store_raw(self, key: str, data: bytes) -> None:

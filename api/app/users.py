@@ -41,6 +41,7 @@ from .credits import CreditRepo, ensure_starter_credits, get_credit_repo
 from .crypto import GEO_KEY_ENV, MESSAGE_KEY_ENV, decrypt_float, decrypt_text
 from .db import get_db_conn
 from .images import release_listing_images
+from .storage import own_photo_url_prefix
 router = APIRouter(prefix="/v1/users", tags=["users"])
 
 ZIP_RE = re.compile(r"^\d{5}$")
@@ -404,11 +405,21 @@ def _validate_profile(data: ProfileIn) -> None:
             status_code=422,
             detail={"code": "invalid_zip", "message": "home_zip must be a 5-digit ZIP code"},
         )
-    if data.avatar_url is not None and not data.avatar_url.startswith(("https://", "http://")):
-        raise HTTPException(
-            status_code=422,
-            detail={"code": "invalid_avatar_url", "message": "avatar_url must be an http(s) URL"},
-        )
+    if data.avatar_url is not None:
+        photo_prefix = own_photo_url_prefix()
+        if photo_prefix is not None:
+            # GCS live: avatars must have come through the upload pipeline.
+            if not data.avatar_url.startswith(photo_prefix):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "avatar_url_not_uploaded",
+                            "message": "avatar_url must come from the upload flow"},
+                )
+        elif not data.avatar_url.startswith(("https://", "http://")):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "invalid_avatar_url", "message": "avatar_url must be an http(s) URL"},
+            )
 
 
 def _attestation_gate(data: ProfileIn, row: dict[str, Any] | None) -> str | None:

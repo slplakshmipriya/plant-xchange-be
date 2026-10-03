@@ -530,7 +530,8 @@ def _attach(ns, tid: str, headers: dict, key: str) -> dict:
 
 def test_delete_photo_message_releases_unshared_gcs_object(gcs_client):
     ns = gcs_client
-    lid, tid = _thread_on_listing(ns, _harvest_payload(["https://example.com/cover.jpg"]))
+    lid, tid = _thread_on_listing(
+        ns, _harvest_payload(["https://storage.googleapis.com/test-bucket/u/alice/cover.jpg"]))
 
     meta = _finalize_as(ns, _png(31), BOB_HEADERS)   # bob's own photo, refcount 1
     key = meta["public_url"].split("test-bucket/")[1]
@@ -572,3 +573,21 @@ def test_delete_photo_message_keeps_shared_gcs_object(gcs_client):
     assert cancelled.status_code == 200, cancelled.text
     assert key in ns.fake.deleted
     assert key not in ns.fake.objects
+
+
+def test_listing_photo_must_be_first_party_on_gcs(gcs_client):
+    """L2: with STORAGE_BACKEND=gcs, a listing cannot hotlink an external
+    image — photos must come through the upload pipeline (EXIF strip,
+    dedupe, quota, GC all depend on it)."""
+    ns = gcs_client
+    ns.users.upsert("alice", display_name="Alice")
+    r = ns.client.post("/v1/listings",
+                       json=_harvest_payload(["https://example.com/cover.jpg"]),
+                       headers=HEADERS)
+    assert r.status_code == 400, r.text
+    assert r.json()["code"] == "photo_url_not_uploaded"
+    r = ns.client.post(
+        "/v1/listings",
+        json=_harvest_payload(["https://storage.googleapis.com/test-bucket/u/alice/x.jpg"]),
+        headers=HEADERS)
+    assert r.status_code == 201, r.text
