@@ -7,7 +7,7 @@ server-side:
   photo URL.
 - ``spray_disclosure`` is mandatory text on every listing (PRD: no silent
   pesticide use).
-- ``credit_cost`` bounded to 1..3 (DB CHECK + API validation).
+- ``credit_cost`` bounded to 1..100 (migration 0039; DB CHECK + API validation).
 - Lifecycle is a strict state machine; illegal transitions are 422, never
   silently coerced. Terminal states: completed, expired, cancelled.
 - SEC-010: responses carry FUZZED geo via ``fuzz_location_for_listing`` — a
@@ -54,6 +54,7 @@ from .images import (
     get_images_repo,
     release_listing_images,
 )
+from .storage import own_photo_url_prefix
 from .notify import (
     NotificationRepo,
     get_notification_repo,
@@ -160,8 +161,8 @@ def fuzz_location_for_listing(lat: float, lon: float, listing_id: str) -> tuple[
     return lat + dlat, lon + dlon
 
 
-def public_listing(row: dict[str, Any], rng: random.Random | None = None,
-                   viewer_uid: str | None = None,
+def public_listing(row: dict[str, Any], rng: random.Random | None = None, *,
+                   viewer_uid: str | None,
                    owners: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """Public serializer: fuzzed geo, no owner PII (owner is just a uid).
 
@@ -178,11 +179,14 @@ def public_listing(row: dict[str, Any], rng: random.Random | None = None,
     "Neighbor" / null so old callers keep working.
 
     L8: ``claimer_uid`` is revealed only to the listing's owner or claimer.
-    Pass the viewer's uid explicitly from every PUBLIC route (feed, detail,
-    cards). ``viewer_uid=None`` (the default) means participant/internal
-    context — the calling route has already established the viewer is a
-    party to the listing (the claim/exchange flows, which must show the
-    claimer to the counterparty to coordinate pickup) — so it is revealed.
+    ``viewer_uid`` is a REQUIRED keyword (L5): every route must state its
+    viewer explicitly. Pass the viewer's uid from every PUBLIC route (feed,
+    detail, cards). ``viewer_uid=None`` means participant/internal context —
+    the calling route has already established the viewer is a party to the
+    listing (the claim/exchange flows, which must show the claimer to the
+    counterparty to coordinate pickup) — so it is revealed. There is no
+    default: a call site that forgets the argument fails loudly instead
+    of silently leaking who claimed a listing.
     """
     lat = decrypt_float(row.get("geo_lat"), GEO_KEY_ENV)
     lon = decrypt_float(row.get("geo_lon"), GEO_KEY_ENV)
@@ -1014,8 +1018,14 @@ def get_retention_repo(conn=Depends(get_db_conn)) -> RetentionRepo:
 
 
 def _validate_common(data: ListingIn | ListingPatch) -> None:
+    photo_prefix = own_photo_url_prefix()
     for url in data.photos or []:
-        if not url.startswith(("https://", "http://")):
+        if photo_prefix is not None:
+            # GCS live: photos must have come through the upload pipeline.
+            if not url.startswith(photo_prefix):
+                raise HTTPException(400, {"code": "photo_url_not_uploaded",
+                                          "message": "photo URLs must come from the upload flow"})
+        elif not url.startswith(("https://", "http://")):
             raise HTTPException(400, {"code": "invalid_photo_url", "message": "photo URLs must be http(s)"})
     window = data.pickup_window
     if window and window.end <= window.start:
