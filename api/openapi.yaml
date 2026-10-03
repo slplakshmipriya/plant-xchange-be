@@ -1334,10 +1334,10 @@ paths:
       - claims
       - claims
       summary: Record No Show
-      description: 'Record a no-show against one side of an exchange. 2 no-shows ->
-        a
+      description: 'Record a no-show against one side of an exchange. 2 no-shows (on
+        two
 
-        30-day claim suspension for that user.'
+        distinct claims) -> a 30-day claim suspension for that user.'
       operationId: record_no_show_v1_exchanges__listing_id__no_show_post
       parameters:
       - name: listing_id
@@ -3183,6 +3183,7 @@ components:
           title: Maxpickers
         creditCost:
           type: integer
+          maximum: 100.0
           minimum: 0.0
           title: Creditcost
         cashCents:
