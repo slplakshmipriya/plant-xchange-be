@@ -235,17 +235,38 @@ def test_earn_cap_blocks_11th_credit(mem_economy, frozen_time):
 
     frozen_time(_dt(2026, 5, 1))
     for i in range(10):
-        crepo.add_entry("alice", 1, "exchange_earn", idempotency_key=f"earn{i}")
+        crepo.add_entry("alice", 1, "welcome_bonus", idempotency_key=f"earn{i}")
 
     with pytest.raises(EarnCapExceededError) as ei:
-        crepo.add_entry("alice", 1, "exchange_earn", idempotency_key="earn10")
+        crepo.add_entry("alice", 1, "welcome_bonus", idempotency_key="earn10")
     assert isinstance(ei.value, HTTPException)
     assert ei.value.status_code == 409
     assert ei.value.detail["code"] == "earn_cap_exceeded"
 
     # A single grant that would cross the cap is blocked too.
     with pytest.raises(EarnCapExceededError):
-        crepo.add_entry("alice", 11, "exchange_earn", idempotency_key="big")
+        crepo.add_entry("alice", 11, "welcome_bonus", idempotency_key="big")
+
+
+def test_transfer_earns_are_cap_exempt(mem_economy, frozen_time):
+    """C1 regression: transfer earns (claim/exchange/slot) and refunds move
+    existing credits — they must never hit the issuance cap, or any listing
+    priced above 10 destroys the claimer's credits on accept."""
+    _, _, _, crepo = mem_economy
+
+    frozen_time(_dt(2026, 5, 1))
+    # Far beyond the issuance cap: all fine, none counted as issuance.
+    crepo.add_entry("alice", 60, "exchange_earn", idempotency_key="t1")
+    crepo.add_entry("alice", 40, "claim_earn", idempotency_key="t2")
+    crepo.add_entry("alice", 25, "slot_earn", idempotency_key="t3")
+    crepo.add_entry("alice", 20, "dispute_reversal", idempotency_key="t4")
+    crepo.add_entry("alice", 20, "claim_reversal", idempotency_key="t5")
+    assert crepo.balance("alice") == 165
+    # Issuance headroom is untouched by the transfers: 10 still allowed.
+    crepo.add_entry("alice", 10, "welcome_bonus", idempotency_key="i1")
+    from app.credits import EarnCapExceededError
+    with pytest.raises(EarnCapExceededError):
+        crepo.add_entry("alice", 1, "welcome_bonus", idempotency_key="i2")
 
 
 def test_earn_cap_resets_after_window(mem_economy, frozen_time):
@@ -253,11 +274,11 @@ def test_earn_cap_resets_after_window(mem_economy, frozen_time):
 
     frozen_time(_dt(2026, 5, 1))
     for i in range(10):
-        crepo.add_entry("alice", 1, "exchange_earn", idempotency_key=f"w{i}")
+        crepo.add_entry("alice", 1, "welcome_bonus", idempotency_key=f"w{i}")
 
     # 8 days later the rolling window no longer covers the earlier earns.
     frozen_time(_dt(2026, 5, 9, 0, 0))
-    crepo.add_entry("alice", 1, "exchange_earn", idempotency_key="w10")
+    crepo.add_entry("alice", 1, "welcome_bonus", idempotency_key="w10")
     assert crepo.balance("alice") >= 11
 
 
@@ -267,11 +288,11 @@ def test_earn_cap_counts_gross_earned_not_net(mem_economy, frozen_time):
 
     frozen_time(_dt(2026, 5, 1))
     for i in range(10):
-        crepo.add_entry("alice", 1, "exchange_earn", idempotency_key=f"g{i}")
+        crepo.add_entry("alice", 1, "welcome_bonus", idempotency_key=f"g{i}")
     # Spending does not free up earn capacity (anti-gaming: earn-then-dump).
     crepo.add_entry("alice", -9, "exchange_spend", idempotency_key="spend1")
     with pytest.raises(EarnCapExceededError):
-        crepo.add_entry("alice", 1, "exchange_earn", idempotency_key="g10")
+        crepo.add_entry("alice", 1, "welcome_bonus", idempotency_key="g10")
 
 
 def test_earn_cap_exempts_starter_and_replays(mem_economy, frozen_time):
@@ -280,30 +301,32 @@ def test_earn_cap_exempts_starter_and_replays(mem_economy, frozen_time):
 
     frozen_time(_dt(2026, 5, 1))
     for i in range(10):
-        crepo.add_entry("alice", 1, "exchange_earn", idempotency_key=f"s{i}")
+        crepo.add_entry("alice", 1, "welcome_bonus", idempotency_key=f"s{i}")
 
     # Starter bootstrap is not "earned": never blocked by the cap.
     credits_mod.ensure_starter_credits("alice", crepo)
     assert any(e["reason"] == "starter" for e in crepo.entries("alice"))
 
     # Idempotent replay of an existing key is not new issuance: no cap hit.
-    row = crepo.add_entry("alice", 1, "exchange_earn", idempotency_key="s0")
+    row = crepo.add_entry("alice", 1, "welcome_bonus", idempotency_key="s0")
     assert row["idempotency_key"] == "s0"
 
 
-def test_earn_cap_surfaces_as_409_through_exchange_confirm(mem_economy, frozen_time):
-    """The cap lives in the choke point, so the (untouched) exchange confirm
-    path surfaces it as a clean 409 envelope."""
+def test_transfer_earns_not_capped_through_exchange_confirm(mem_economy, frozen_time):
+    """C1/H1 regression: the giver's exchange_earn is a transfer, so prior
+    earnings in the window must not block completion — at any price in the
+    1–100 band (migration 0039)."""
     client, _, _, crepo = mem_economy
     frozen_time(_dt(2026, 5, 1))
 
     _profile(client, ALICE, "Alice")
     _profile(client, BOB, "Bob")
-    # Alice has already earned 10 credits inside the rolling window.
-    for i in range(10):
-        crepo.add_entry("alice", 1, "exchange_earn", idempotency_key=f"c{i}")
+    # Alice has already received 100 credits of transfers inside the window.
+    crepo.add_entry("alice", 100, "exchange_earn", idempotency_key="prior")
+    # Bob is funded by transfers too (starter 3 + 60), so he can claim at 50.
+    crepo.add_entry("bob", 60, "exchange_earn", idempotency_key="bobfund")
 
-    r = client.post("/v1/listings", json=_listing_payload(cost=2), headers=ALICE)
+    r = client.post("/v1/listings", json=_listing_payload(cost=50), headers=ALICE)
     assert r.status_code == 201, r.text
     lid = r.json()["id"]
 
@@ -312,11 +335,11 @@ def test_earn_cap_surfaces_as_409_through_exchange_confirm(mem_economy, frozen_t
     r = client.post("/v1/exchange/confirm", json={"listing_id": lid}, headers=BOB)
     assert r.status_code == 200, r.text
 
-    # Alice's confirm would earn her 2 more -> over the cap -> 409.
+    # Alice's confirm earns her 50 more as a transfer -> completes.
     r = client.post("/v1/exchange/confirm", json={"listing_id": lid}, headers=ALICE)
-    assert r.status_code == 409, r.text
-    assert r.json()["code"] == "earn_cap_exceeded"
-    assert "request_id" in r.json()
+    assert r.status_code == 200, r.text
+    assert crepo.balance("alice") == 153  # 3 starter + 100 prior + 50
+    assert crepo.balance("bob") == 13     # 3 starter + 60 funded - 50
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +441,7 @@ def test_earn_cap_holds_under_concurrency():
 
     def earn(i):
         try:
-            repo.add_entry("alice", 1, "exchange_earn", ref_id=f"r{i}",
+            repo.add_entry("alice", 1, "welcome_bonus", ref_id=f"r{i}",
                            idempotency_key=f"earn:{i}")
             results.append("ok")
         except EarnCapExceededError:

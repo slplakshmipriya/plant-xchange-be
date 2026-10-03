@@ -24,12 +24,17 @@ Starter grant (M22 reconciliation):
   source of truth; the PRD wording still needs reconciling.
 
 Anti-gaming earn cap:
-- Max 10 credits earned per user per rolling 7 days, enforced inside
-  ``add_entry`` — the single choke point every issuance flow goes through
-  (exchange confirm, future earn paths). Breaches raise
-  ``EarnCapExceededError`` (HTTP 409 ``earn_cap_exceeded``), which the app's
-  exception handler renders in the standard error envelope. The starter
-  bootstrap is not "earned" and is exempt.
+- Max 10 credits of new ISSUANCE per user per rolling 7 days, enforced
+  inside ``add_entry`` — the single choke point every issuance flow goes
+  through. "Issuance" excludes transfers: ``claim_earn`` /
+  ``exchange_earn`` / ``slot_earn`` move existing credits between users
+  and ``claim_reversal`` / ``dispute_reversal`` hand a user's own credits
+  back, so none of them can inflate the supply or be "gamed" by earning
+  — and since migration 0039 prices run 1–100, capping transfer earns
+  would make most listings un-completable and (before the money legs
+  were made atomic) silently destroyed claimers' credits. Breaches on
+  genuine issuance raise ``EarnCapExceededError`` (HTTP 409
+  ``earn_cap_exceeded``). The starter bootstrap is exempt.
 - H12: the cap check and the INSERT run inside a per-uid locked transaction
   (``pg_advisory_xact_lock`` on Postgres; per-uid ``threading.Lock`` in the
   memory repo), so concurrent earns can't both slip under the cap.
@@ -52,9 +57,18 @@ from .db import get_db_conn
 
 STARTER_CREDITS = 3
 
-# Anti-gaming: max credits earnable per rolling window.
+# Anti-gaming: max credits of new issuance per rolling window (transfers
+# between users are exempt — see TRANSFER_REASONS).
 EARN_CAP_PER_7D = 10
 EARN_CAP_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+
+# Reasons that MOVE credits rather than mint them: the giver-side leg of a
+# claim/exchange/slot, and refund legs that hand a user their own credits
+# back. Exempt from the earn cap and never counted toward it.
+TRANSFER_REASONS = frozenset({
+    "claim_earn", "exchange_earn", "slot_earn",
+    "claim_reversal", "dispute_reversal",
+})
 
 # Expiry warning windows (both visible on the credit-expiry endpoint).
 WARNING_30D_MS = 30 * 24 * 60 * 60 * 1000
@@ -196,12 +210,12 @@ class EarnCapExceededError(HTTPException):
 
 def _earned_in_window(entries: list[dict[str, Any]], now_ms: int,
                       window_ms: int = EARN_CAP_WINDOW_MS) -> int:
-    """Credits earned inside the rolling window. Positive issuance counts;
-    the starter bootstrap and spends do not."""
+    """Credits ISSUED inside the rolling window. The starter bootstrap,
+    spends, and transfers between users do not count."""
     cutoff = now_ms - window_ms
     total = 0
     for e in entries:
-        if e.get("reason") == "starter":
+        if e.get("reason") in ("starter", *TRANSFER_REASONS):
             continue
         delta = int(e.get("delta", 0))
         if delta > 0 and _entry_ms(e) > cutoff:
@@ -211,9 +225,11 @@ def _earned_in_window(entries: list[dict[str, Any]], now_ms: int,
 
 def _check_earn_cap(uid: str, delta: int, reason: str,
                     credit_repo: "CreditRepo", now_ms: int) -> None:
-    """Enforce the rolling 7-day earn cap. Called by every ``add_entry`` —
-    the single choke point all issuance flows through."""
-    if delta <= 0 or reason == "starter":
+    """Enforce the rolling 7-day issuance cap. Called by every
+    ``add_entry`` — the single choke point all earn paths flow through.
+    Transfers and refunds are exempt: they conserve the credit supply,
+    and capping them breaks the 1–100 price band (migration 0039)."""
+    if delta <= 0 or reason in ("starter", *TRANSFER_REASONS):
         return
     earned = _earned_in_window(credit_repo.entries(uid), now_ms)
     if earned + delta > EARN_CAP_PER_7D:

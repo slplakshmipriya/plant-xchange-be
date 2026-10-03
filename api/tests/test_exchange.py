@@ -360,8 +360,8 @@ def test_whole_claim_blocked_for_suspended_user(mem_exchange):
     client, _, _, _, claim_repo, _ = mem_exchange
     lid = _make_listing(client, cost=2)
     _profile(client, BOB, "Bob")
-    claim_repo.record_no_show("bob")
-    claim_repo.record_no_show("bob")  # 2 strikes -> 30-day suspension
+    claim_repo.record_no_show_report("claim-1", "alice", "bob")
+    claim_repo.record_no_show_report("claim-2", "alice", "bob")  # 2 strikes -> 30-day suspension
     r = client.post(f"/v1/listings/{lid}/claim", headers=BOB)
     assert r.status_code == 403, r.text
     assert r.json()["code"] == "claim_suspended"
