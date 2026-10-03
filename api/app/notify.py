@@ -251,9 +251,13 @@ class PostgresNotificationRepo:
         return [r["token"] for r in rows]
 
     def register_token(self, uid: str, token: str, platform: str = "android") -> None:
+        # One owner per token (0042): re-registering a token reassigns it
+        # to the latest account instead of fanning pushes out to all of
+        # them (L4).
         self._conn.execute(
             "INSERT INTO device_tokens (user_uid, token, platform) VALUES (%s,%s,%s) "
-            "ON CONFLICT (user_uid, token) DO UPDATE SET "
+            "ON CONFLICT (token) DO UPDATE SET "
+            "user_uid = EXCLUDED.user_uid, "
             "platform = EXCLUDED.platform, last_seen_at = now()",
             (uid, token, platform),
         )
@@ -322,6 +326,11 @@ class MemoryNotificationRepo:
         return list(self._tokens.get(uid, []))
 
     def register_token(self, uid: str, token: str, platform: str = "android") -> None:
+        # Mirror the Postgres semantics (0042): a token belongs to exactly
+        # one account — registering it elsewhere moves it.
+        for other_uid, toks in self._tokens.items():
+            if other_uid != uid and token in toks:
+                toks.remove(token)
         tokens = self._tokens.setdefault(uid, [])
         if token not in tokens:
             tokens.append(token)

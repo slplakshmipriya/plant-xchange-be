@@ -49,6 +49,7 @@ from .db import get_db_conn
 from .listings import ListingRepo, batch_owners, get_listing_repo, public_listing, utcnow
 from .moderation import ModerationRepo, get_moderation_repo, get_suspension
 from .notify import NotificationRepo, get_notification_repo, send_notification
+from .txn import atomic
 from .users import UserRepo, get_user_repo
 
 router = APIRouter(prefix="/v1", tags=["claims"])
@@ -84,9 +85,13 @@ class ClaimRepo(Protocol):
     def count_recent_claims(self, claimer_uid: str, since: datetime) -> int:
         """Claims created by this claimer at or after ``since``."""
         ...
-    def record_no_show(self, uid: str) -> dict[str, Any]:
-        """Increment the user's no-show strikes; suspend when the threshold
-        is hit. Returns the updated strike row."""
+    def record_no_show_report(self, claim_id: str, reporter_uid: str,
+                              target_uid: str) -> dict[str, Any] | None:
+        """Record one no-show report and increment the target's strikes.
+
+        Returns the updated strike row, or ``None`` when this
+        (claim, reporter, target) report already exists — one strike per
+        claim per reporter, so suspension needs two distinct claims."""
         ...
     def get_strikes(self, uid: str) -> dict[str, Any] | None: ...
 
@@ -168,19 +173,29 @@ class PostgresClaimRepo:
         ).fetchone()
         return int(row["n"])
 
-    def record_no_show(self, uid: str) -> dict[str, Any]:
+    def record_no_show_report(self, claim_id: str, reporter_uid: str,
+                              target_uid: str) -> dict[str, Any] | None:
+        inserted = self._conn.execute(
+            "INSERT INTO claim_no_show_reports (id, claim_id, reporter_uid, target_uid) "
+            "VALUES (%s,%s,%s,%s) "
+            "ON CONFLICT (claim_id, reporter_uid, target_uid) DO NOTHING RETURNING id",
+            (uuid.uuid4(), claim_id, reporter_uid, target_uid),
+        ).fetchone()
+        if inserted is None:
+            self._conn.commit()
+            return None
         row = self._conn.execute(
             "INSERT INTO claim_no_show_strikes (uid, no_shows) VALUES (%s, 1) "
             "ON CONFLICT (uid) DO UPDATE SET no_shows = claim_no_show_strikes.no_shows + 1 "
             "RETURNING *",
-            (uid,),
+            (target_uid,),
         ).fetchone()
         if int(row["no_shows"]) >= NO_SHOW_SUSPENSION_THRESHOLD:
             suspended_until = utcnow() + timedelta(days=NO_SHOW_SUSPENSION_DAYS)
             row = self._conn.execute(
                 "UPDATE claim_no_show_strikes SET suspended_until = %s WHERE uid = %s "
                 "RETURNING *",
-                (suspended_until, uid),
+                (suspended_until, target_uid),
             ).fetchone()
         self._conn.commit()
         return self._strike(row)
@@ -196,6 +211,7 @@ class MemoryClaimRepo:
     def __init__(self):
         self._claims: dict[str, dict[str, Any]] = {}
         self._strikes: dict[str, dict[str, Any]] = {}
+        self._no_show_reports: set[tuple[str, str, str]] = set()
 
     def create(self, data: dict[str, Any]) -> dict[str, Any]:
         row = {
@@ -253,9 +269,15 @@ class MemoryClaimRepo:
                 n += 1
         return n
 
-    def record_no_show(self, uid: str) -> dict[str, Any]:
+    def record_no_show_report(self, claim_id: str, reporter_uid: str,
+                              target_uid: str) -> dict[str, Any] | None:
+        key = (claim_id, reporter_uid, target_uid)
+        if key in self._no_show_reports:
+            return None
+        self._no_show_reports.add(key)
         strike = self._strikes.setdefault(
-            uid, {"uid": uid, "no_shows": 0, "suspended_until": None, "banned_until": None}
+            target_uid, {"uid": target_uid, "no_shows": 0,
+                         "suspended_until": None, "banned_until": None}
         )
         strike["no_shows"] += 1
         if strike["no_shows"] >= NO_SHOW_SUSPENSION_THRESHOLD:
@@ -520,7 +542,7 @@ def create_claim(
         ref=f"claim:{claim['id']}",
         repo=notify_repo,
     )
-    return {"listing": public_listing(updated,
+    return {"listing": public_listing(updated, viewer_uid=None,
                                        owners=batch_owners(user_repo, [updated])),
             "claim": _public_claim(claim)}
 
@@ -623,7 +645,7 @@ def cancel_claim(
         raise HTTPException(409, {"code": "claim_not_active",
                                   "message": "Claim was already resolved by a concurrent action"})
     updated = _restore_quantity(listing_id, float(claim["quantity"]), listing_repo)
-    return {"listing": public_listing(updated,
+    return {"listing": public_listing(updated, viewer_uid=None,
                                        owners=batch_owners(user_repo, [updated])),
             "claim": _public_claim(claim)}
 
@@ -651,9 +673,13 @@ def accept_claim(
     if claim["status"] != "pending":
         raise HTTPException(409, {"code": "claim_not_pending",
                                   "message": f"Cannot accept a '{claim['status']}' claim"})
-    # C2 money leg: the claimer spends the listing's credit_cost and the
-    # giver earns it, idempotent per claim (claim:<id>:spend / claim:<id>:earn)
-    # — the same pattern as exchange.confirm and slots.claim.
+    # Money leg: the claimer spends the listing's credit_cost and the giver
+    # earns it, idempotent per claim (claim:<id>:spend / claim:<id>:earn) —
+    # the same pattern as exchange.confirm and slots.claim. Spend, earn and
+    # the status flip land in ONE transaction (``atomic``): the previous
+    # code posted the spend outside any transaction and the earn after it,
+    # so a rejected earn (the 7-day cap, back when it counted transfers)
+    # left the claimer charged with no way to unwind.
     cost = row["credit_cost"]
     claimer_uid = claim["claimer_uid"]
     # Balance can change between claim creation and accept — recheck so an
@@ -664,22 +690,21 @@ def accept_claim(
         if credit_repo.balance(claimer_uid) < cost:
             raise HTTPException(422, {"code": "insufficient_credits",
                                       "message": "Claimer no longer has enough credits"})
-        # Entries land before the status flip so a crash mid-flight is
-        # recoverable by retry: re-adds are idempotent no-ops, then the flip
-        # completes.
-        credit_repo.add_entry(claimer_uid, -cost, "claim_spend",
-                              ref_id=claim["id"],
-                              idempotency_key=f"claim:{claim['id']}:spend")
-    credit_repo.add_entry(row["owner_uid"], cost, "claim_earn",
-                          ref_id=claim["id"],
-                          idempotency_key=f"claim:{claim['id']}:earn")
-    claim = claim_repo.set_status(claim["id"], "accepted")
-    if claim is None:
-        # Lost a race with a concurrent cancel/decline (H8).
-        raise HTTPException(409, {"code": "claim_not_pending",
-                                  "message": "Claim is no longer pending"})
+        with atomic(credit_repo, claim_repo):
+            credit_repo.add_entry(claimer_uid, -cost, "claim_spend",
+                                  ref_id=claim["id"],
+                                  idempotency_key=f"claim:{claim['id']}:spend")
+            credit_repo.add_entry(row["owner_uid"], cost, "claim_earn",
+                                  ref_id=claim["id"],
+                                  idempotency_key=f"claim:{claim['id']}:earn")
+            claim = claim_repo.set_status(claim["id"], "accepted")
+            if claim is None:
+                # Lost a race with a concurrent cancel/decline (H8). Raising
+                # inside ``atomic`` rolls the money leg back on Postgres.
+                raise HTTPException(409, {"code": "claim_not_pending",
+                                          "message": "Claim is no longer pending"})
     accepted_listing = listing_repo.get(listing_id)
-    return {"listing": public_listing(accepted_listing,
+    return {"listing": public_listing(accepted_listing, viewer_uid=None,
                                        owners=batch_owners(user_repo, [accepted_listing])),
             "claim": _public_claim(claim)}
 
@@ -712,7 +737,7 @@ def decline_claim(
         raise HTTPException(409, {"code": "claim_not_pending",
                                   "message": "Claim is no longer pending"})
     updated = _restore_quantity(listing_id, float(claim["quantity"]), listing_repo)
-    return {"listing": public_listing(updated,
+    return {"listing": public_listing(updated, viewer_uid=None,
                                        owners=batch_owners(user_repo, [updated])),
             "claim": _public_claim(claim)}
 
@@ -725,8 +750,8 @@ def record_no_show(
     listing_repo: ListingRepo = Depends(get_listing_repo),
     claim_repo: ClaimRepo = Depends(get_claim_repo),
 ) -> dict[str, Any]:
-    """Record a no-show against one side of an exchange. 2 no-shows -> a
-    30-day claim suspension for that user."""
+    """Record a no-show against one side of an exchange. 2 no-shows (on two
+    distinct claims) -> a 30-day claim suspension for that user."""
     row = listing_repo.get(listing_id)
     if row is None:
         raise HTTPException(404, {"code": "listing_not_found", "message": "No such listing"})
@@ -738,7 +763,22 @@ def record_no_show(
     if uid not in (row["owner_uid"], claim["claimer_uid"]):
         raise HTTPException(403, {"code": "not_a_party",
                                   "message": "Only the giver and claimer can report a no-show"})
-    strike = claim_repo.record_no_show(target_uid)
+    if target_uid == uid:
+        raise HTTPException(422, {"code": "cannot_report_self",
+                                  "message": "You cannot report yourself as a no-show"})
+    # A no-show can only have happened once the pickup window has ended.
+    # (Claims created without a pickup window can't be gated — the
+    # per-claim dedupe below still bounds them to one strike per claim.)
+    pickup_end_ms = claim.get("pickup_end_ms")
+    if pickup_end_ms is not None:
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        if now_ms < int(pickup_end_ms):
+            raise HTTPException(422, {"code": "pickup_window_open",
+                                      "message": "The pickup window has not ended yet"})
+    strike = claim_repo.record_no_show_report(str(claim["id"]), uid, target_uid)
+    if strike is None:
+        raise HTTPException(409, {"code": "no_show_already_reported",
+                                  "message": "You already reported a no-show on this claim"})
     return {
         "uid": target_uid,
         "side": data.side,
