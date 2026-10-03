@@ -18,6 +18,13 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (ValueError, TypeError):
+        return default
+
+
 @dataclass(frozen=True)
 class Settings:
     database_url: str | None       # Neon Postgres connection string
@@ -44,6 +51,11 @@ class Settings:
     # --- Phone hashing (M2) ---
     environment: str               # ENVIRONMENT: "local" (dev default), "staging", "production"
     phone_hash_secret: str | None  # PHONE_HASH_SECRET: HMAC key for phone_hash()
+    # --- Pre-publish message moderation (NL moderateText) ---
+    moderation_enabled: bool       # MODERATION_ENABLED: "1" (default) gates chat
+                                   # sends through text_moderation before insert
+    moderation_threshold: float    # MODERATION_THRESHOLD: block when a block-list
+                                   # category scores >= this (default 0.8)
 
 
 def get_settings() -> Settings:
@@ -68,6 +80,8 @@ def get_settings() -> Settings:
         stripe_webhook_secret=os.environ.get("STRIPE_WEBHOOK_SECRET"),
         environment=os.environ.get("ENVIRONMENT", "local"),
         phone_hash_secret=os.environ.get("PHONE_HASH_SECRET"),
+        moderation_enabled=os.environ.get("MODERATION_ENABLED", "1") == "1",
+        moderation_threshold=_float("MODERATION_THRESHOLD", 0.8),
     )
 
 

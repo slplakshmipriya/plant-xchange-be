@@ -13,5 +13,9 @@ pillow==12.3.0
 # GCS object storage for listing photos (STORAGE_BACKEND=gcs). Lazily
 # imported — dev/CI without credentials keep working; prod must install it.
 google-cloud-storage==3.15.1
+# Service-account auth (ADC) for the Natural Language moderation call
+# (app/text_moderation.py). Also a firebase-admin/google-cloud-storage
+# dependency; pinned explicitly because app code imports it directly.
+google-auth==2.59.1
 # At-rest field encryption: message bodies + listing geo (Fernet/AES-256-GCM)
 cryptography==44.0.1
