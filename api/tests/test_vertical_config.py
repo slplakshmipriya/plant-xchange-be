@@ -59,6 +59,8 @@ def test_default_is_garden_default():
     assert v.brand.nouns.seeker == "claimer"
     assert all(vars(v.modules).values())
     assert v.economy.credit_name == "credit"
+    assert v.economy.credits_enabled is True
+    assert v.economy.usd_services_enabled is True
     assert v.economy.starter_credits == 3
     assert v.economy.earn_cap_amount == 10
     assert v.economy.earn_cap_window_days == 7
@@ -127,7 +129,8 @@ def test_config_endpoint_public_allowlist(client):
     assert body["brand"]["display_name"] == "Garden Swap"
     assert body["brand"]["nouns"]["provider"] == "sitter"
     assert body["economy"] == {
-        "credit_name": "credit", "starter_credits": 3,
+        "credit_name": "credit", "credits_enabled": True,
+        "usd_services_enabled": True, "starter_credits": 3,
         "max_listing_cost": 100, "credit_expiry": "seasonal",
     }
     assert body["fees"] == {"sitter_platform_fee_pct": 18}
@@ -343,6 +346,8 @@ def test_sitter_radius_default_is_garden_five(mem_sitting_v):
     {"taxonomy": {"sitter_services": []}},                   # empty, sitters on
     {"taxonomy": {"listing_types": []}},                     # empty, listings on
     {"modules": {"listings": "yes"}},                        # wrong type
+    {"economy": {"credits_enabled": "yes"}},                 # switch not bool
+    {"economy": {"usd_services_enabled": 1}},                # switch not bool
 ])
 def test_strict_schema_rejections(payload):
     with pytest.raises(VerticalConfigError):

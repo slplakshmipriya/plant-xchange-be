@@ -75,8 +75,11 @@ def _setup_booking(client, urepo, srepo, price_cents: int | None = 10000,
     req = r.json()
     if price_cents is not None:
         # sitting_requests carry no price yet (pricing lands with the sitter
-        # track); seed the quote the payments seam reads.
+        # track); seed the quote the payments seam reads. The seeded price
+        # is USD-denominated, so seed the rate snapshot (migration 0044)
+        # with it — a positive amount with no snapshot now fails closed.
         srepo._requests[req["id"]]["subtotal_cents"] = price_cents
+        srepo._requests[req["id"]]["rate_unit"] = "usd"
     r = client.post(f"/v1/sitting-requests/{req['id']}/accept", headers=BOB)
     assert r.json()["status"] == "accepted"
     return r.json()
