@@ -13,6 +13,8 @@
   "economy": {
     "credit_expiry": "seasonal",
     "credit_name": "token",
+    "credits_enabled": true,
+    "usd_services_enabled": true,
     "earn_cap_amount": 10,
     "earn_cap_window_days": 7,
     "max_listing_cost": 50,

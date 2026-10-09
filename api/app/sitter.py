@@ -208,11 +208,11 @@ class PostgresSitterRepo:
         rid = str(uuid.uuid4())
         self._conn.execute(
             """INSERT INTO sitting_requests
-               (id, owner_uid, sitter_uid, plant_count, dates, services, notes)
-               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+               (id, owner_uid, sitter_uid, plant_count, dates, services, notes, rate_unit)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
             (rid, row["owner_uid"], row["sitter_uid"], row["plant_count"],
              list(row["dates"]), list(row.get("services") or []),
-             row.get("notes", "")),
+             row.get("notes", ""), row.get("rate_unit")),
         )
         self._conn.commit()
         return self.get_request(rid)
@@ -357,6 +357,10 @@ class MemorySitterRepo:
                 for d in row["dates"]}),
             "services": [str(s) for s in (row.get("services") or [])],
             "notes": row.get("notes", ""),
+            # Denomination snapshot (migration 0044): the sitter's
+            # rate_unit frozen at request creation; internal only —
+            # _serialize_request deliberately does not expose it.
+            "rate_unit": row.get("rate_unit"),
             "status": "requested", "created_at": utcnow().isoformat(),
         }
         self._requests[rid] = rec
@@ -512,6 +516,15 @@ def upsert_sitter_profile(
     if user_repo.get(uid) is None:
         raise HTTPException(400, {"code": "profile_required",
                                   "message": "Create a profile (POST /v1/users) first"})
+    if (data.rate_unit == "usd"
+            and not get_vertical().economy.usd_services_enabled):
+        # usd_services_enabled=False: reject the USD unit outright. The
+        # model requires amount+unit together, so every reachable USD
+        # unit here is a priced profile; and even a bare unit would
+        # advertise dollar pricing this vertical does not allow.
+        raise HTTPException(422, {"code": "usd_services_disabled",
+                                  "message": "Dollar-priced services are "
+                                             "disabled for this community"})
     row = repo.upsert_profile(uid, data.model_dump())
     return _serialize_profile(row, _display_name(user_repo, uid))
 
@@ -624,6 +637,13 @@ def create_sitting_request(
     if profile is None or not profile.get("active", True):
         raise HTTPException(422, {"code": "sitter_unavailable",
                                   "message": "That sitter is not offering sitting right now"})
+    if (profile.get("rate_unit") == "usd"
+            and not get_vertical().economy.usd_services_enabled):
+        # Covers sitters whose USD pricing predates the switch flip:
+        # their stored profile stays untouched, but no new USD bookings.
+        raise HTTPException(422, {"code": "usd_services_disabled",
+                                  "message": "Dollar-priced services are "
+                                             "disabled for this community"})
     # 0035 opt-in availability: a request is only valid on days the sitter
     # marked available. available_dates may be date objects (Postgres) or ISO
     # strings (memory repo) — normalize to ISO for the comparison.
@@ -653,6 +673,10 @@ def create_sitting_request(
         "dates": [d.isoformat() for d in req_dates],
         "services": list(data.services),
         "notes": data.notes.strip(),
+        # Snapshot the denomination this booking is made under
+        # (migration 0044) so later profile re-pricing or a vertical
+        # switch flip cannot re-denominate it at payment time.
+        "rate_unit": profile.get("rate_unit"),
     })
     return _serialize_request(row)
 

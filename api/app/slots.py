@@ -231,9 +231,14 @@ class SlotIn(BaseModel):
         # (migration 0015) bounds credit_cost >= 0 with NO upper bound,
         # so this validator (and the static Field(le=100)) is the only
         # thing keeping slot prices at or under the vertical's ceiling.
-        # The vertical may lower that ceiling but never raise it.
-        max_cost = get_vertical().economy.max_listing_cost
-        if v > max_cost:
+        # The vertical may lower that ceiling but never raise it. The
+        # ceiling is model-enforced only while credits are ON: while OFF,
+        # a priced cost passes the model (up to the static Field bound)
+        # so the route can reject it with the enveloped 422
+        # credits_disabled instead of a bare validation error.
+        economy = get_vertical().economy
+        max_cost = economy.max_listing_cost
+        if economy.credits_enabled and v > max_cost:
             raise ValueError(
                 f"creditCost must be <= {max_cost} for this marketplace")
         return v
@@ -262,6 +267,10 @@ def create_slot(
     """Open a pick-your-own slot window on a tree. Owner only."""
     tree = _tree_or_404(tree_id, listing_repo)
     ensure_owner(tree["owner_uid"], uid)
+    if not get_vertical().economy.credits_enabled and data.creditCost > 0:
+        raise HTTPException(422, {"code": "credits_disabled",
+                                  "message": "Credits are disabled for this "
+                                             "community — slots must be free"})
     if data.startMs >= data.endMs:
         raise HTTPException(422, {"code": "invalid_window",
                                   "message": "startMs must be before endMs"})
@@ -333,13 +342,17 @@ def claim_slot(
                       "message": "Solo pick-your-own requires a verified ID "
                                  "(complete ID verification first)"})
     cost = slot["credit_cost"]
+    # credits_enabled=False: the spot is still claimed atomically, but no
+    # credits move — no balance gate, no ledger legs. (A slot priced
+    # while credits were on keeps its stored cost; it just never moves.)
+    credits_on = get_vertical().economy.credits_enabled
     # H11: the balance gate and the spend post are serialized per claimer —
     # two concurrent slot claims would otherwise both pass the gate and
     # both post, driving the balance negative. The atomic spot claim runs
     # inside the same critical section so a won spot is always paid for
     # exactly once, and a lost race pays nothing.
     with serialize_spend(uid, credit_repo):
-        if credit_repo.balance(uid) < cost:
+        if credits_on and credit_repo.balance(uid) < cost:
             raise HTTPException(422, {"code": "insufficient_credits",
                                       "message": "Not enough credits — give before you claim"})
         # Atomic claim: the (slot, claimer) record, the claimed_count
@@ -360,9 +373,13 @@ def claim_slot(
             # Credits move through the append-only ledger (same pattern as
             # exchange.confirm). Idempotency keys include the claimer so each
             # claim is a distinct spot purchase.
-            base_key = f"slot:{slot_id}:{uid}"
-            credit_repo.add_entry(uid, -cost, "slot_spend", ref_id=slot_id,
-                                  idempotency_key=f"{base_key}:spend")
-            credit_repo.add_entry(slot["owner_uid"], cost, "slot_earn", ref_id=slot_id,
-                                  idempotency_key=f"{base_key}:earn")
+            if credits_on and cost:
+                # cost == 0 (free slot claimed after a credits flip-on)
+                # posts NO legs — zero-delta rows are forbidden by the
+                # ledger CHECK and move nothing.
+                base_key = f"slot:{slot_id}:{uid}"
+                credit_repo.add_entry(uid, -cost, "slot_spend", ref_id=slot_id,
+                                      idempotency_key=f"{base_key}:spend")
+                credit_repo.add_entry(slot["owner_uid"], cost, "slot_earn", ref_id=slot_id,
+                                      idempotency_key=f"{base_key}:earn")
     return {"slot": public_slot(updated)}

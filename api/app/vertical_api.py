@@ -42,6 +42,8 @@ def public_vertical_config(v: VerticalConfig) -> dict[str, Any]:
         "modules": asdict(v.modules),
         "economy": {
             "credit_name": v.economy.credit_name,
+            "credits_enabled": v.economy.credits_enabled,
+            "usd_services_enabled": v.economy.usd_services_enabled,
             "starter_credits": v.economy.starter_credits,
             "max_listing_cost": v.economy.max_listing_cost,
             "credit_expiry": v.economy.credit_expiry,

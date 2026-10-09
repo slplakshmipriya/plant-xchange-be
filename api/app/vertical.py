@@ -15,7 +15,8 @@ Selection (first match wins, resolved once per process):
 
 Validation is strict and runs at load: unknown keys are rejected, the
 economy/fee bounds mirror the DB constraints (listing credit cost can
-never exceed the 1–100 CHECK ceiling), and ``credit_expiry`` only
+never exceed the 0–100 CHECK ceiling — migration 0043 widened the
+original 1–100), and ``credit_expiry`` only
 supports ``"seasonal"`` in v1. A malformed config must kill the boot
 (``main.py`` calls :func:`get_vertical` in the lifespan) rather than
 degrade into a silently different marketplace.
@@ -67,11 +68,21 @@ class ModulesConfig:
 @dataclass(frozen=True)
 class EconomyConfig:
     credit_name: str = "credit"
+    # Master switches for the two money systems. credits_enabled=False
+    # runs the vertical as free/plain exchange: only free (cost 0)
+    # listings/slots may be created, claims and slot claims move no
+    # credits, and no starter lot is granted. usd_services_enabled=False
+    # means sitters may only price in credits: USD-priced profiles,
+    # bookings, and payment quotes are rejected. Both default on, so
+    # the garden default is byte-identical to the pre-switch behavior.
+    credits_enabled: bool = True
+    usd_services_enabled: bool = True
     starter_credits: int = 3
     earn_cap_amount: int = 10
     earn_cap_window_days: int = 7
-    # Mirrors the listings.credit_cost DB CHECK (1..100): a vertical may
-    # lower the price ceiling, never raise it past the schema bound.
+    # Mirrors the listings.credit_cost DB CHECK (0..100 since migration
+    # 0043 freed the floor): a vertical may lower the price ceiling,
+    # never raise it past the schema bound.
     max_listing_cost: int = 100
     # Only "seasonal" is implemented (credits.py season math); "never"
     # is rejected at load until that mode actually exists.
@@ -230,7 +241,8 @@ def vertical_from_dict(d: dict) -> VerticalConfig:
     })
 
     eco_d = _section(d, "economy")
-    _keys(eco_d, {"credit_name", "starter_credits", "earn_cap_amount",
+    _keys(eco_d, {"credit_name", "credits_enabled", "usd_services_enabled",
+                  "starter_credits", "earn_cap_amount",
                   "earn_cap_window_days", "max_listing_cost", "credit_expiry"},
           "economy")
     starter = _int(eco_d, "starter_credits", 3, "economy")
@@ -253,6 +265,8 @@ def vertical_from_dict(d: dict) -> VerticalConfig:
             "only 'seasonal' is supported")
     economy = EconomyConfig(
         credit_name=_str(eco_d, "credit_name", "credit", "economy"),
+        credits_enabled=_bool(eco_d, "credits_enabled", True, "economy"),
+        usd_services_enabled=_bool(eco_d, "usd_services_enabled", True, "economy"),
         starter_credits=starter,
         earn_cap_amount=cap_amt,
         earn_cap_window_days=cap_days,
