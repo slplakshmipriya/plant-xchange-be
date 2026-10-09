@@ -7,7 +7,9 @@ server-side:
   photo URL.
 - ``spray_disclosure`` is mandatory text on every listing (PRD: no silent
   pesticide use).
-- ``credit_cost`` bounded to 1..100 (migration 0039; DB CHECK + API validation).
+- ``credit_cost`` bounded to 0..100 (migration 0043; DB CHECK + API
+  validation). The 1-credit floor applies only while the vertical's
+  credits are enabled; credits_enabled=False requires free listings.
 - Lifecycle is a strict state machine; illegal transitions are 422, never
   silently coerced. Terminal states: completed, expired, cancelled.
 - SEC-010: responses carry FUZZED geo via ``fuzz_location_for_listing`` — a
@@ -781,7 +783,7 @@ class ListingIn(BaseModel):
     variety: str | None = Field(default=None, max_length=120)
     quantity: float | None = Field(default=None, gt=0)
     unit: str | None = Field(default=None, max_length=20)
-    credit_cost: int = Field(ge=1, le=100)
+    credit_cost: int = Field(ge=0, le=100)
     pickup_window: PickupWindow | None = None
     expires_at: datetime | None = None
     geo_lat: float | None = Field(default=None, ge=-90, le=90)
@@ -805,10 +807,24 @@ class ListingIn(BaseModel):
     def _credit_cost_within_vertical(cls, v):
         # The static Field(le=100) mirrors the DB CHECK ceiling; the
         # vertical may lower the price ceiling but never raise it.
-        max_cost = get_vertical().economy.max_listing_cost
-        if v is not None and v > max_cost:
+        # credits_enabled keeps the historic 1-credit floor (the old
+        # static Field ge=1): a 0-cost listing is only meaningful when
+        # credits are disabled, and in that mode the ROUTE rejects priced
+        # listings with the enveloped 422 `credits_disabled` — so the
+        # model deliberately lets a priced cost through to the route
+        # when credits are off.
+        economy = get_vertical().economy
+        if v is not None and economy.credits_enabled and v < 1:
+            raise ValueError("credit_cost must be >= 1")
+        if v is not None and economy.credits_enabled and v > economy.max_listing_cost:
+            # The ceiling is only model-enforced while credits are ON.
+            # While OFF, a priced cost must pass the model (up to the
+            # static Field bound) so the ROUTE can reject it with the
+            # enveloped 422 credits_disabled instead of a bare
+            # validation error.
             raise ValueError(
-                f"credit_cost must be <= {max_cost} for this marketplace")
+                f"credit_cost must be <= {economy.max_listing_cost} "
+                "for this marketplace")
         return v
 
 
@@ -817,7 +833,7 @@ class ListingPatch(BaseModel):
     variety: str | None = Field(default=None, max_length=120)
     quantity: float | None = Field(default=None, gt=0)
     unit: str | None = Field(default=None, max_length=20)
-    credit_cost: int | None = Field(default=None, ge=1, le=100)
+    credit_cost: int | None = Field(default=None, ge=0, le=100)
     pickup_window: PickupWindow | None = None
     expires_at: datetime | None = None
     spray_disclosure: str | None = Field(default=None, min_length=1, max_length=2000)
@@ -836,10 +852,18 @@ class ListingPatch(BaseModel):
     @field_validator("credit_cost", mode="after")
     @classmethod
     def _credit_cost_within_vertical(cls, v):
-        max_cost = get_vertical().economy.max_listing_cost
-        if v is not None and v > max_cost:
+        # Same mode rules as ListingIn (see there): 1-credit floor only
+        # while credits are enabled; the priced-patch rejection when
+        # credits are disabled lives in the route (enveloped 422).
+        economy = get_vertical().economy
+        if v is not None and economy.credits_enabled and v < 1:
+            raise ValueError("credit_cost must be >= 1")
+        if v is not None and economy.credits_enabled and v > economy.max_listing_cost:
+            # Credits OFF: let priced patches through to the route's
+            # enveloped credits_disabled 422 (see ListingIn validator).
             raise ValueError(
-                f"credit_cost must be <= {max_cost} for this marketplace")
+                f"credit_cost must be <= {economy.max_listing_cost} "
+                "for this marketplace")
         return v
 
 
@@ -1065,6 +1089,12 @@ def create_listing(
     notify_repo: NotificationRepo = Depends(get_notification_repo),
 ) -> dict[str, Any]:
     _validate_common(data)
+    if not get_vertical().economy.credits_enabled and data.credit_cost > 0:
+        # credits_enabled=False: free exchange only. Enforced here (not
+        # in the model) so the rejection carries the enveloped code.
+        raise HTTPException(422, {"code": "credits_disabled",
+                                  "message": "Credits are disabled for this "
+                                             "community — listings must be free"})
     if user_repo.get(uid) is None:
         raise HTTPException(400, {"code": "profile_required",
                                   "message": "Create a profile (POST /v1/users) before listing"})
@@ -1166,6 +1196,10 @@ def patch_listing(
     if row["status"] not in EDITABLE_STATUSES:
         raise HTTPException(422, {"code": "listing_locked",
                                   "message": f"Cannot edit a listing in status '{row['status']}'"})
+    if not get_vertical().economy.credits_enabled and data.credit_cost:
+        raise HTTPException(422, {"code": "credits_disabled",
+                                  "message": "Credits are disabled for this "
+                                             "community — listings must be free"})
     _validate_common(data)
     fields: dict[str, Any] = {k: v for k, v in data.model_dump(exclude_unset=True).items()
                               if v is not None and k != "status"}
