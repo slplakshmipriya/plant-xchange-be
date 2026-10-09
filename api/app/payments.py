@@ -86,14 +86,30 @@ PAYABLE_STATUSES = frozenset({"accepted"})
 # Pure fee math
 # ---------------------------------------------------------------------------
 
+class UsdServicesDisabledError(ValueError):
+    """A USD-denominated booking was quoted in a vertical that disabled
+    dollar services (``economy.usd_services_enabled=False``). A ValueError
+    subclass so pure-function callers see a validation failure; the route
+    maps it to the enveloped 422 ``usd_services_disabled``."""
+
+
+def _ensure_usd_services_allowed(unit: Any) -> None:
+    if unit == "usd" and not get_vertical().economy.usd_services_enabled:
+        raise UsdServicesDisabledError(
+            "Dollar-priced services are disabled for this community")
+
+
 def quote_booking(booking: dict[str, Any]) -> dict[str, int]:
     """Quote a sitting booking: the customer pays the subtotal; the 18%
     platform fee is deducted from the sitter's payout.
 
     ``booking`` is any mapping carrying ``subtotal_cents`` (the sitter's quoted
     price in cents; defaults to 0 when the booking is not priced yet).
-    Raises ``ValueError`` on a negative or non-integer subtotal.
+    Raises ``ValueError`` on a negative or non-integer subtotal, and
+    ``UsdServicesDisabledError`` when the mapping declares a USD booking
+    (``rate_unit == "usd"``) in a vertical with USD services disabled.
     """
+    _ensure_usd_services_allowed(booking.get("rate_unit"))
     subtotal = booking.get("subtotal_cents", 0)
     if isinstance(subtotal, bool) or not isinstance(subtotal, int):
         raise ValueError(f"subtotal_cents must be an int, got {subtotal!r}")
@@ -309,8 +325,30 @@ def create_sitting_intent(
                                   "message": f"A '{status}' booking cannot be "
                                              "paid; only accepted bookings can"})
 
+    # USD gate: a booking's denomination is the rate_unit SNAPSHOT taken
+    # when the sitting request was created (migration 0044) — never the
+    # sitter's current profile, which may have been re-priced since.
+    # Checked before the quote so a USD booking in a credits-only
+    # vertical gets the specific code. A missing snapshot (NULL: the
+    # booking predates snapshotting) with a positive amount fails
+    # closed: we cannot prove the booking isn't dollar-denominated.
+    snapshot_unit = booking.get("rate_unit")
+    subtotal = booking.get("subtotal_cents", 0)
+    if (snapshot_unit is None and isinstance(subtotal, int)
+            and not isinstance(subtotal, bool) and subtotal > 0):
+        raise HTTPException(422, {"code": "usd_services_disabled",
+                                  "message": "This booking's denomination "
+                                             "is unknown (it predates rate "
+                                             "snapshotting), so a payment "
+                                             "hold cannot be created"})
     try:
-        quote = quote_booking(booking)
+        quote = quote_booking({
+            **booking,
+            "rate_unit": snapshot_unit,
+        })
+    except UsdServicesDisabledError as exc:
+        raise HTTPException(422, {"code": "usd_services_disabled",
+                                  "message": str(exc)})
     except ValueError as exc:
         raise HTTPException(422, {"code": "invalid_booking_amount",
                                   "message": str(exc)})

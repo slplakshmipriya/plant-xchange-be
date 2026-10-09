@@ -65,6 +65,7 @@ from .auth import get_current_uid
 from .credits import CreditRepo, EarnCapExceededError, get_credit_repo
 from .db import get_db_conn
 from .listings import ListingRepo, get_listing_repo
+from .vertical import get_vertical
 
 router = APIRouter(prefix="/v1", tags=["moderation"])
 
@@ -664,6 +665,25 @@ def create_dispute(
     return {"dispute": _serialize_dispute(dispute)}
 
 
+def _exchange_has_forward_credit_legs(credit_repo: CreditRepo,
+                                      listing: dict[str, Any]) -> bool:
+    """True when the exchange's forward credit legs actually posted.
+
+    The exchange money leg (exchange.py confirm) records its spend/earn
+    entries with ``ref_id`` = the listing/exchange id, so a completed
+    exchange that ran while credits were off (or at cost 0) has none —
+    the exact distinction the dispute-reversal gate needs: unwinding a
+    real leg is always legal, inventing one is not."""
+    exchange_id = str(listing["id"])
+    parties = {listing.get("claimer_uid"), listing.get("owner_uid")} - {None}
+    for party in parties:
+        for entry in credit_repo.entries(party):
+            if (entry.get("ref_id") == exchange_id
+                    and entry.get("reason") in ("exchange_spend", "exchange_earn")):
+                return True
+    return False
+
+
 @router.post("/disputes/{dispute_id}/resolve")
 def resolve_dispute(
     dispute_id: str,
@@ -693,6 +713,22 @@ def resolve_dispute(
     if data.outcome == DisputeOutcome.upheld and data.reversalCredits > 0:
         listing = listing_repo.get(dispute["exchange_id"])
         if listing is not None:
+            if (not get_vertical().economy.credits_enabled
+                    and not _exchange_has_forward_credit_legs(credit_repo, listing)):
+                # Credits are off NOW and this exchange never moved any
+                # (completed while credits were off): there is no credit
+                # flow to unwind, so a positive reversal is meaningless
+                # rather than a mint. (If forward legs DO exist — posted
+                # before a flip-off — the unwind below still posts, same
+                # as the claims cancel path.) reversalCredits=0 never
+                # reaches this branch and always stays allowed.
+                raise HTTPException(
+                    422, {"code": "credits_disabled",
+                          "message": "Credits are disabled for this "
+                                     "community and this exchange moved "
+                                     "no credits — there is nothing to "
+                                     "reverse. Resolve with "
+                                     "reversalCredits=0."})
             # Reverse credit flow: claimer gets credits back, giver is
             # debited. Posted BEFORE the status flip (M11). The legs are
             # ``dispute_reversal`` — a refund, cap-exempt since the earn
