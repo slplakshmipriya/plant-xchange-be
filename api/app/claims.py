@@ -53,6 +53,7 @@ from .moderation import ModerationRepo, get_moderation_repo, get_suspension
 from .notify import NotificationRepo, get_notification_repo, send_notification
 from .txn import atomic
 from .users import UserRepo, get_user_repo
+from .vertical import get_vertical
 
 router = APIRouter(prefix="/v1", tags=["claims"])
 
@@ -458,7 +459,11 @@ def create_claim(
         raise HTTPException(400, {"code": "profile_required",
                                   "message": "Create a profile (POST /v1/users) before claiming"})
     _enforce_claim_eligibility(uid, claim_repo, mod_repo)
-    if credit_repo.balance(uid) < row["credit_cost"]:
+    # credits_enabled=False: free exchange — no balance gate at all (a
+    # listing priced before the switch keeps its stored cost, but claims
+    # on it move nothing while credits are off; see accept_claim).
+    if (get_vertical().economy.credits_enabled
+            and credit_repo.balance(uid) < row["credit_cost"]):
         raise HTTPException(422, {"code": "insufficient_credits",
                                   "message": "Not enough credits — give before you claim"})
     available = _available_quantity(row)
@@ -595,14 +600,27 @@ def cancel_claim(
     if claim["status"] == "accepted":
         # Unwind the accept-time money leg (same idempotency pattern as the
         # forward leg, so a retried cancel cannot double-refund). Posted
-        # before the status flip, mirroring exchange.confirm.
-        cost = row["credit_cost"]
-        credit_repo.add_entry(claim["claimer_uid"], cost, "claim_reversal",
-                              ref_id=claim["id"],
-                              idempotency_key=f"claim:{claim['id']}:reversal:claimer")
-        credit_repo.add_entry(row["owner_uid"], -cost, "claim_reversal",
-                              ref_id=claim["id"],
-                              idempotency_key=f"claim:{claim['id']}:reversal:giver")
+        # before the status flip, mirroring exchange.confirm. The reversal
+        # is gated on the forward leg EXISTING, not on the current switch
+        # position: an accept posted under credits-on unwinds even if the
+        # vertical has since switched credits off, and an accept that
+        # moved nothing (credits off) reverses nothing.
+        # The reversal amount is what the forward leg ACTUALLY moved
+        # (abs of the spend entry), never the listing's current price:
+        # the listing may have been re-priced after the accept (e.g.
+        # patched to free while credits were off), and unwinding the
+        # wrong amount would mint or burn credits.
+        spend = credit_repo.find_by_idempotency_key(
+            f"claim:{claim['id']}:spend")
+        if spend is not None:
+            amount = abs(int(spend["delta"]))
+            if amount:
+                credit_repo.add_entry(claim["claimer_uid"], amount, "claim_reversal",
+                                      ref_id=claim["id"],
+                                      idempotency_key=f"claim:{claim['id']}:reversal:claimer")
+                credit_repo.add_entry(row["owner_uid"], -amount, "claim_reversal",
+                                      ref_id=claim["id"],
+                                      idempotency_key=f"claim:{claim['id']}:reversal:giver")
     claim = claim_repo.set_status(claim["id"], "cancelled")
     if claim is None:
         # Lost a race with a concurrent accept/decline (H8): the
@@ -647,21 +665,31 @@ def accept_claim(
     # left the claimer charged with no way to unwind.
     cost = row["credit_cost"]
     claimer_uid = claim["claimer_uid"]
+    # credits_enabled=False: the accept still completes the exchange but
+    # moves NO credits — no balance gate, no ledger legs, no earn-cap
+    # check (the ledger is never touched). A listing priced before the
+    # switch keeps its stored credit_cost; it simply never moves while
+    # credits are off.
+    credits_on = get_vertical().economy.credits_enabled
     # Balance can change between claim creation and accept — recheck so an
     # accept can never drive a balance negative (same as exchange.confirm).
     # The recheck and the spend post are serialized per claimer (H11): two
     # concurrent accepts would otherwise both pass the gate and both spend.
     with serialize_spend(claimer_uid, credit_repo):
-        if credit_repo.balance(claimer_uid) < cost:
+        if credits_on and credit_repo.balance(claimer_uid) < cost:
             raise HTTPException(422, {"code": "insufficient_credits",
                                       "message": "Claimer no longer has enough credits"})
         with atomic(credit_repo, claim_repo):
-            credit_repo.add_entry(claimer_uid, -cost, "claim_spend",
-                                  ref_id=claim["id"],
-                                  idempotency_key=f"claim:{claim['id']}:spend")
-            credit_repo.add_entry(row["owner_uid"], cost, "claim_earn",
-                                  ref_id=claim["id"],
-                                  idempotency_key=f"claim:{claim['id']}:earn")
+            if credits_on and cost:
+                # cost == 0 (free listing accepted after a credits
+                # flip-on) posts NO legs: the ledger forbids zero-delta
+                # rows, and a free exchange moves nothing by definition.
+                credit_repo.add_entry(claimer_uid, -cost, "claim_spend",
+                                      ref_id=claim["id"],
+                                      idempotency_key=f"claim:{claim['id']}:spend")
+                credit_repo.add_entry(row["owner_uid"], cost, "claim_earn",
+                                      ref_id=claim["id"],
+                                      idempotency_key=f"claim:{claim['id']}:earn")
             claim = claim_repo.set_status(claim["id"], "accepted")
             if claim is None:
                 # Lost a race with a concurrent cancel/decline (H8). Raising

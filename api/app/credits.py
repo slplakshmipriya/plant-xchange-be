@@ -260,7 +260,13 @@ class CreditRepo(Protocol):
                   idempotency_key: str | None = None) -> dict[str, Any]:
         """Append a ledger entry. Idempotent on idempotency_key: repeats
         return the existing entry instead of double-posting. Positive
-        issuance is subject to the rolling 7-day earn cap (409)."""
+        issuance is subject to the rolling 7-day earn cap (409).
+
+        A zero ``delta`` is a no-op (returns the idempotent replay when
+        one exists, else None): the credit_ledger CHECK forbids
+        ``delta = 0`` rows, so no caller may ever post one — flip-matrix
+        paths (free listing accepted after credits switch on) rely on
+        this guard instead of crashing at the DB."""
         ...
     def find_by_idempotency_key(self, key: str) -> dict[str, Any] | None: ...
     def balance(self, uid: str) -> int:
@@ -291,6 +297,10 @@ class PostgresCreditRepo:
             existing = self.find_by_idempotency_key(idempotency_key)
             if existing is not None:
                 return existing
+        if delta == 0:
+            # Zero legs never reach the ledger (CHECK delta <> 0) — see
+            # the Protocol docstring. No lock, no cap check, no insert.
+            return None
         # H12: serialize cap-check + insert per uid. pg_advisory_xact_lock is
         # transaction-scoped — it releases automatically at the commit below,
         # so a crashed request can't leave the lock held.
@@ -364,6 +374,10 @@ class MemoryCreditRepo:
         with self._lock_for(uid):
             if idempotency_key and idempotency_key in self._by_key:
                 return dict(self._by_key[idempotency_key])
+            if delta == 0:
+                # Zero legs are no-ops (the PG ledger forbids delta = 0
+                # rows; the memory mirror must behave identically).
+                return None
             _check_earn_cap(uid, delta, reason, self, _now_ms())
             row = {
                 "id": str(uuid.uuid4()), "uid": uid, "delta": delta, "reason": reason,
@@ -411,6 +425,14 @@ def ensure_starter_credits(uid: str, credit_repo: CreditRepo) -> None:
     0028 adds a unique partial index on ``(uid) WHERE reason='starter'`` as
     defense-in-depth behind the key.
     """
+    # credits_enabled=False (vertical config): the marketplace runs free
+    # exchange — no starter lot exists, not even a 0-value one.
+    if not get_vertical().economy.credits_enabled:
+        return
+    if get_vertical().economy.starter_credits <= 0:
+        # starter_credits=0 is a deliberate "no bootstrap" policy: grant
+        # nothing (and never post a forbidden zero-delta starter row).
+        return
     if not any(e["reason"] == "starter" for e in credit_repo.entries(uid)):
         credit_repo.add_entry(
             uid, get_vertical().economy.starter_credits, "starter", ref_id=uid,

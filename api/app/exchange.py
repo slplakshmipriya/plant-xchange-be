@@ -38,6 +38,7 @@ from .images import (
 from .listings import ListingRepo, batch_owners, can_transition, get_listing_repo, public_listing
 from .moderation import ModerationRepo, get_moderation_repo
 from .txn import atomic as _atomic
+from .vertical import get_vertical
 from .users import UserRepo, get_user_repo
 
 router = APIRouter(prefix="/v1", tags=["credits"])
@@ -86,7 +87,10 @@ def claim_listing(
     # user blocked on POST /v1/listings/{id}/claims can simply claim
     # here instead.
     _enforce_claim_eligibility(uid, claim_repo, mod_repo)
-    if credit_repo.balance(uid) < row["credit_cost"]:
+    # credits_enabled=False: free exchange — no balance gate (confirm
+    # moves nothing either; see confirm_exchange).
+    if (get_vertical().economy.credits_enabled
+            and credit_repo.balance(uid) < row["credit_cost"]):
         raise HTTPException(422, {"code": "insufficient_credits",
                                   "message": "Not enough credits — give before you claim"})
     # Atomic: concurrent claimants cannot both win; the loser gets None.
@@ -144,6 +148,10 @@ def confirm_exchange(
     confirmed = set(credit_repo.confirmations(data.listing_id))
     if {row["owner_uid"], row["claimer_uid"]} <= confirmed and can_transition("claimed", "completed"):
         cost = row["credit_cost"]
+        # credits_enabled=False: the exchange still completes (status
+        # flip + image release) but no credits move and no balance
+        # recheck runs — the ledger legs below are skipped entirely.
+        credits_on = get_vertical().economy.credits_enabled
         # Deterministic server-side keys: exactly-once credit moves even when
         # the client sends no idempotency key and two confirms race.
         base_key = data.idempotency_key or f"exchange:{data.listing_id}"
@@ -157,7 +165,8 @@ def confirm_exchange(
         # two concurrent confirms would otherwise both pass the gate and
         # both spend, driving the balance negative.
         with serialize_spend(row["claimer_uid"], credit_repo):
-            if (credit_repo.find_by_idempotency_key(spend_key) is None
+            if (credits_on
+                    and credit_repo.find_by_idempotency_key(spend_key) is None
                     and credit_repo.balance(row["claimer_uid"]) < cost):
                 raise HTTPException(422, {"code": "insufficient_credits",
                                           "message": "Claimer no longer has enough credits"})
@@ -169,12 +178,16 @@ def confirm_exchange(
             # are no-ops, then the flip completes.
             completed = None
             with _atomic(repo, credit_repo):
-                credit_repo.add_entry(row["claimer_uid"], -cost, "exchange_spend",
-                                      ref_id=data.listing_id,
-                                      idempotency_key=spend_key)
-                credit_repo.add_entry(row["owner_uid"], cost, "exchange_earn",
-                                      ref_id=data.listing_id,
-                                      idempotency_key=f"{base_key}:earn")
+                if credits_on and cost:
+                    # cost == 0 (free listing confirmed after a credits
+                    # flip-on) posts NO legs — zero-delta rows are
+                    # forbidden by the ledger CHECK and move nothing.
+                    credit_repo.add_entry(row["claimer_uid"], -cost, "exchange_spend",
+                                          ref_id=data.listing_id,
+                                          idempotency_key=spend_key)
+                    credit_repo.add_entry(row["owner_uid"], cost, "exchange_earn",
+                                          ref_id=data.listing_id,
+                                          idempotency_key=f"{base_key}:earn")
                 completed = repo.complete_if_claimed(data.listing_id)
                 if completed is not None:
                     row = completed
