@@ -2206,7 +2206,11 @@ paths:
       - trees
       - trees
       summary: List Slots
-      description: 'List a tree''s slots. Wire shape: exactly {slots: [...]}.'
+      description: 'List a tree''s slots. Wire shape: {slots: [...]} — each slot the
+
+        caller has claimed also carries their claim annotations
+
+        (``claimed_by_me``/``visit_confirmed``/``lbs_picked``).'
       operationId: list_slots_v1_trees__tree_id__slots_get
       parameters:
       - name: tree_id
@@ -2272,6 +2276,63 @@ paths:
                 additionalProperties: true
                 title: Response Claim Slot V1 Trees  Tree Id  Slots  Slot Id  Claim
                   Post
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - bearerAuth: []
+  /v1/trees/{tree_id}/slots/{slot_id}/confirm-visit:
+    post:
+      tags:
+      - trees
+      - trees
+      summary: Confirm Visit
+      description: 'Confirm a pick-your-own visit after the fact: the claimer records
+
+        how much they picked (``{"lbs_picked": <number>}``, 0 < lbs <= 1000).
+
+        Lands on the caller''s claim row (migration 0045); NO credits move —
+
+        they settled at claim time. Idempotent: confirming again updates the
+
+        recorded pick. Only a claimer may confirm, and the PICKUP suspension
+
+        gate applies exactly as on claim.'
+      operationId: confirm_visit_v1_trees__tree_id__slots__slot_id__confirm_visit_post
+      parameters:
+      - name: tree_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Tree Id
+      - name: slot_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Slot Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              title: Payload
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                title: Response Confirm Visit V1 Trees  Tree Id  Slots  Slot Id  Confirm
+                  Visit Post
         '422':
           description: Validation Error
           content:
