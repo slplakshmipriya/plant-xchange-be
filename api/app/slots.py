@@ -7,6 +7,9 @@
   credit ledger and ``claimed_count`` increments. Full slots and empty
   wallets are rejected (409/422); the owner cannot claim their own slot;
   a repeat claim by the same picker is rejected (409).
+- ``POST /v1/trees/{id}/slots/{slot_id}/confirm-visit``: after the visit,
+  the claimer records how much they picked (``lbs_picked``). Lands on
+  their ``slot_claims`` row (migration 0045); no credits move.
 
 Suspension enforcement is module-local on purpose: ``check_pillar_suspension``
 is a stub that the coordinator will rewire to the shared moderation module
@@ -16,10 +19,12 @@ it).
 
 from __future__ import annotations
 
+import math
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from .auth import ensure_owner, get_current_uid
@@ -70,6 +75,25 @@ def public_slot(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def with_caller_claim(slot: dict[str, Any],
+                      claim: dict[str, Any] | None) -> dict[str, Any]:
+    """Annotate a public slot with the CALLER's own claim, if they hold one.
+
+    Adds exactly ``claimed_by_me`` (true) and ``visit_confirmed`` (bool),
+    plus ``lbs_picked`` once the claimer has recorded a pick. A caller
+    with no claim on the slot gets the untouched public shape — other
+    users' claims (and who claimed) are never exposed.
+    """
+    if claim is None:
+        return slot
+    out = dict(slot)
+    out["claimed_by_me"] = True
+    out["visit_confirmed"] = claim.get("visited_at") is not None
+    if claim.get("lbs_picked") is not None:
+        out["lbs_picked"] = claim["lbs_picked"]
+    return out
+
+
 # ---------------------------------------------------------------- repository
 
 class SlotRepo(Protocol):
@@ -90,6 +114,18 @@ class SlotRepo(Protocol):
         spot on this slot.
         """
         ...
+    def get_claim(self, slot_id: str, claimer_uid: str) -> dict[str, Any] | None:
+        """The claimer's claim record on this slot, or None."""
+        ...
+    def confirm_visit(self, slot_id: str, claimer_uid: str,
+                      lbs_picked: float, visited_at_ms: int) -> dict[str, Any] | None:
+        """Record the visit outcome on the claimer's claim (migration 0045).
+
+        Sets ``lbs_picked``/``visited_at``; idempotent — a repeat confirm
+        overwrites both. Returns the updated claim, or None when the
+        claimer holds no claim on this slot.
+        """
+        ...
 
 
 class PostgresSlotRepo:
@@ -104,8 +140,20 @@ class PostgresSlotRepo:
     @staticmethod
     def _row(row) -> dict:
         d = dict(row)
-        c = d.get("created_at")
-        d["created_at"] = c.isoformat() if hasattr(c, "isoformat") else c
+        # psycopg hands back uuid.UUID for the UUID columns (slots.id,
+        # slots.tree_id, slot_claims.slot_id; owner_uid/claimer_uid are
+        # TEXT). The memory repo stores plain strings, and route handlers
+        # compare row fields against string path params
+        # (``slot["tree_id"] != tree_id``) — so normalize UUIDs to str
+        # here, the one place Postgres slot/claim rows are materialized.
+        # Without this, every PG-backed slot route 404s on the tree
+        # mismatch even though the row exists.
+        for k, v in d.items():
+            if isinstance(v, uuid.UUID):
+                d[k] = str(v)
+        if "created_at" in d:
+            c = d["created_at"]
+            d["created_at"] = c.isoformat() if hasattr(c, "isoformat") else c
         return d
 
     def create(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -174,11 +222,40 @@ class PostgresSlotRepo:
             raise
         return self.get(slot_id)
 
+    _CLAIM_SELECT = (
+        "SELECT slot_id, claimer_uid, lbs_picked, visited_at FROM slot_claims"
+    )
+
+    def get_claim(self, slot_id: str, claimer_uid: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            self._CLAIM_SELECT + " WHERE slot_id = %s AND claimer_uid = %s",
+            (slot_id, claimer_uid),
+        ).fetchone()
+        # Through _row so slot_id normalizes to str, same as memory rows.
+        return self._row(row) if row else None
+
+    def confirm_visit(self, slot_id: str, claimer_uid: str,
+                      lbs_picked: float, visited_at_ms: int) -> dict[str, Any] | None:
+        # Single UPDATE keyed on the claim's UNIQUE (slot, claimer) pair —
+        # atomic on its own and idempotent: re-confirming overwrites the
+        # recorded pick. No credits move here (they settled at claim
+        # time), so there is nothing to keep atomic with the ledger.
+        row = self._conn.execute(
+            "UPDATE slot_claims SET lbs_picked = %s, visited_at = %s "
+            "WHERE slot_id = %s AND claimer_uid = %s RETURNING slot_id",
+            (lbs_picked, visited_at_ms, slot_id, claimer_uid),
+        ).fetchone()
+        if row is None:
+            self._conn.rollback()
+            return None
+        self._conn.commit()
+        return self.get_claim(slot_id, claimer_uid)
+
 
 class MemorySlotRepo:
     def __init__(self):
         self._rows: dict[str, dict[str, Any]] = {}
-        self._claims: set[tuple[str, str]] = set()
+        self._claims: dict[tuple[str, str], dict[str, Any]] = {}
 
     def create(self, data: dict[str, Any]) -> dict[str, Any]:
         row = dict(data)
@@ -202,12 +279,30 @@ class MemorySlotRepo:
         row = self._rows.get(slot_id)
         if row is None or row["claimed_count"] >= row["max_pickers"]:
             return None
-        self._claims.add(key)
+        self._claims[key] = {
+            "slot_id": slot_id,
+            "claimer_uid": claimer_uid,
+            "lbs_picked": None,
+            "visited_at": None,
+        }
         row["claimed_count"] += 1
         return dict(row)
 
     def has_claim(self, slot_id: str, claimer_uid: str) -> bool:
         return (slot_id, claimer_uid) in self._claims
+
+    def get_claim(self, slot_id: str, claimer_uid: str) -> dict[str, Any] | None:
+        claim = self._claims.get((slot_id, claimer_uid))
+        return dict(claim) if claim is not None else None
+
+    def confirm_visit(self, slot_id: str, claimer_uid: str,
+                      lbs_picked: float, visited_at_ms: int) -> dict[str, Any] | None:
+        claim = self._claims.get((slot_id, claimer_uid))
+        if claim is None:
+            return None
+        claim["lbs_picked"] = lbs_picked
+        claim["visited_at"] = visited_at_ms
+        return dict(claim)
 
 
 def get_slot_repo(conn=Depends(get_db_conn)) -> SlotRepo:
@@ -292,12 +387,18 @@ def create_slot(
 @router.get("/trees/{tree_id}/slots", tags=["trees"])
 def list_slots(
     tree_id: str,
+    uid: str = Depends(get_current_uid),
     listing_repo: ListingRepo = Depends(get_listing_repo),
     slot_repo: SlotRepo = Depends(get_slot_repo),
 ) -> dict[str, Any]:
-    """List a tree's slots. Wire shape: exactly {slots: [...]}."""
+    """List a tree's slots. Wire shape: {slots: [...]} — each slot the
+    caller has claimed also carries their claim annotations
+    (``claimed_by_me``/``visit_confirmed``/``lbs_picked``)."""
     _tree_or_404(tree_id, listing_repo)
-    return {"slots": [public_slot(s) for s in slot_repo.list_by_tree(tree_id)]}
+    return {"slots": [
+        with_caller_claim(public_slot(s), slot_repo.get_claim(s["id"], uid))
+        for s in slot_repo.list_by_tree(tree_id)
+    ]}
 
 
 @router.post("/trees/{tree_id}/slots/{slot_id}/claim", tags=["trees"])
@@ -383,3 +484,54 @@ def claim_slot(
                 credit_repo.add_entry(slot["owner_uid"], cost, "slot_earn", ref_id=slot_id,
                                       idempotency_key=f"{base_key}:earn")
     return {"slot": public_slot(updated)}
+
+
+@router.post("/trees/{tree_id}/slots/{slot_id}/confirm-visit", tags=["trees"])
+def confirm_visit(
+    tree_id: str,
+    slot_id: str,
+    payload: dict[str, Any] = Body(...),
+    uid: str = Depends(get_current_uid),
+    listing_repo: ListingRepo = Depends(get_listing_repo),
+    slot_repo: SlotRepo = Depends(get_slot_repo),
+    mod_repo: ModerationRepo = Depends(get_moderation_repo),
+) -> dict[str, Any]:
+    """Confirm a pick-your-own visit after the fact: the claimer records
+    how much they picked (``{"lbs_picked": <number>}``, 0 < lbs <= 1000).
+    Lands on the caller's claim row (migration 0045); NO credits move —
+    they settled at claim time. Idempotent: confirming again updates the
+    recorded pick. Only a claimer may confirm, and the PICKUP suspension
+    gate applies exactly as on claim."""
+    _tree_or_404(tree_id, listing_repo)
+    slot = slot_repo.get(slot_id)
+    if slot is None or slot["tree_id"] != tree_id:
+        raise HTTPException(404, {"code": "slot_not_found", "message": "No such slot"})
+    susp = get_suspension(mod_repo, uid, PICKUP_PILLAR)
+    if susp is not None:
+        raise HTTPException(403, {"code": "suspended",
+                                  "message": f"Suspended ({susp['type']}): {susp['reason']}"})
+    claim = slot_repo.get_claim(slot_id, uid)
+    if claim is None:
+        raise HTTPException(403, {"code": "not_claimed",
+                                  "message": "You have not claimed a spot in this slot"})
+    lbs = payload.get("lbs_picked") if isinstance(payload, dict) else None
+    # A huge JSON int (e.g. a 400-digit number) parses as a Python bigint
+    # whose float() raises OverflowError — that is an invalid pick
+    # amount (422), not a server error, so convert defensively. NaN/inf
+    # are rejected by the finiteness check.
+    try:
+        lbs_val = float(lbs) if isinstance(lbs, (int, float)) \
+            and not isinstance(lbs, bool) else None
+    except (OverflowError, ValueError):
+        lbs_val = None
+    if lbs_val is None or not math.isfinite(lbs_val) \
+            or not 0 < lbs_val <= 1000:
+        raise HTTPException(422, {"code": "invalid_lbs",
+                                  "message": "lbs_picked must be greater than 0 "
+                                             "and at most 1000"})
+    visited_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    updated_claim = slot_repo.confirm_visit(slot_id, uid, lbs_val, visited_at_ms)
+    if updated_claim is None:  # claim deleted between check and update
+        raise HTTPException(403, {"code": "not_claimed",
+                                  "message": "You have not claimed a spot in this slot"})
+    return {"slot": with_caller_claim(public_slot(slot), updated_claim)}
